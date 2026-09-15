@@ -1,0 +1,20 @@
+{
+  "status": "design-only",
+  "observed_at_utc": "2026-09-14T16:00:12.382207+00:00",
+  "base_commit": "17c61062c2f9ce9bcdd45a2082e491f9743a2770",
+  "source_is_modified_worktree": true,
+  "plugin_implemented": false,
+  "production_changed_this_turn": false,
+  "scope": "local-source-extension-interface-review",
+  "files": {
+    "core/registry.go": "a2e62467b2f06394f8f53587c75c03c547dfa19dfb7b6ade28a1a8e8ed9c105d",
+    "cmd/cc-connect/plugin_platform_feishu.go": "e3ec98a920169d5ffb1bab5f92bcdc762bde60f34ce32d85135af5ae560239c1",
+    "core/command.go": "5202d42a358d39bc1c2e82cb935245d952c054a378437540b21cb07f7b0a99da",
+    "core/engine.go": "def402ec38c20c58f2cbb5bdd0ea13230c4b0d59f02d7727817aed0ae96e2dcc",
+    "core/bridge.go": "cf9303527e125ba67abb3bd4c4b952ca3ae2ba03dd2bd332b49946d5696120ff",
+    "core/bridge_capabilities.go": "27161b314c2a6602bd856d72cbb6793f05618f465e9e640d8a332090312f925b",
+    "core/ccs_picker.go": "39cfdbf016219ba5e64c13587070a4a5ff05635f29662d14343d6131acd263a5",
+    "core/provider_control.go": "55c2dc999ea95e9d52b3b36a9162855f3fd157cd23932e2d57c197ed7166ee94",
+    "docs/bridge-protocol.md": "5587c1c89626f10f115ccb1eee29c30c6262123b27ca00ccf92a31cf8ed62faf"
+  }
+}
