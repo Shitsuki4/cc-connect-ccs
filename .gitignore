@@ -1,0 +1,15 @@
+# Local scratch, binaries, and secrets. Never commit these.
+*.exe
+*.exe.sha256
+*.log
+*.jsonl
+core/test_ws_*.json
+.env
+.env.*
+control-api.json
+config.toml
+*.pre-update-*.exe
+rustup-init.exe
+__pycache__/
+.tmp/
+
