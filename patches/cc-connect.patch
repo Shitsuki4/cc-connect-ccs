@@ -1,0 +1,3659 @@
+diff --git a/cmd/cc-connect/main.go b/cmd/cc-connect/main.go
+index acdbd35..5364982 100644
+--- a/cmd/cc-connect/main.go
++++ b/cmd/cc-connect/main.go
+@@ -419,6 +419,9 @@ func main() {
+ 		}
+ 
+ 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
++		if err := configureProviderControl(engine, proj.ProviderControl); err != nil {
++			slog.Warn("provider control is not configured", "project", proj.Name, "error", err)
++		}
+ 		// Wire display settings including show_context_indicator and reply_footer
+ 		// Global [display] config can be overridden by project-level settings
+ 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
+diff --git a/cmd/cc-connect/provider_control.go b/cmd/cc-connect/provider_control.go
+new file mode 100644
+index 0000000..2e897c5
+--- /dev/null
++++ b/cmd/cc-connect/provider_control.go
+@@ -0,0 +1,56 @@
++package main
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/chenhg5/cc-connect/config"
++	"github.com/chenhg5/cc-connect/core"
++)
++
++func configureProviderControl(engine *core.Engine, cfg *config.ProviderControlConfig) error {
++	if cfg == nil {
++		return nil
++	}
++	path, app, err := providerControlLocation(cfg)
++	if err != nil {
++		return err
++	}
++	control, err := core.NewProviderControl(path, app)
++	if err != nil {
++		return err
++	}
++	engine.SetProviderControl(control)
++	return nil
++}
++
++func providerControlLocation(cfg *config.ProviderControlConfig) (string, string, error) {
++	app := strings.TrimSpace(cfg.App)
++	if app == "" {
++		app = strings.TrimSpace(cfg.AppType)
++	}
++	if app == "" {
++		return "", "", fmt.Errorf("provider_control.app is required")
++	}
++	if cfg.App != "" && cfg.AppType != "" && cfg.App != cfg.AppType {
++		return "", "", fmt.Errorf("provider_control.app and app_type disagree")
++	}
++	path := strings.TrimSpace(cfg.ConfigFile)
++	if path == "" && cfg.DBPath != "" {
++		path = filepath.Join(filepath.Dir(cfg.DBPath), "control-api.json")
++	}
++	if path == "" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
++		home, err := os.UserHomeDir()
++		if err != nil {
++			return "", "", fmt.Errorf("resolve provider control home: %w", err)
++		}
++		if path == "" {
++			path = filepath.Join(home, ".cc-switch", "control-api.json")
++		} else {
++			path = filepath.Join(home, path[2:])
++		}
++	}
++	return path, strings.ToLower(app), nil
++}
+diff --git a/cmd/cc-connect/provider_control_test.go b/cmd/cc-connect/provider_control_test.go
+new file mode 100644
+index 0000000..5ade6cb
+--- /dev/null
++++ b/cmd/cc-connect/provider_control_test.go
+@@ -0,0 +1,37 @@
++package main
++
++import (
++	"path/filepath"
++	"testing"
++
++	"github.com/chenhg5/cc-connect/config"
++)
++
++func TestProviderControlLocationSupportsExistingDeployments(t *testing.T) {
++	dir := t.TempDir()
++	for _, tc := range []struct {
++		name string
++		cfg  config.ProviderControlConfig
++		want string
++		app  string
++	}{
++		{"explicit", config.ProviderControlConfig{ConfigFile: filepath.Join(dir, "control.json"), App: "codex"}, filepath.Join(dir, "control.json"), "codex"},
++		{"legacy-database", config.ProviderControlConfig{DBPath: filepath.Join(dir, "cc-switch.db"), AppType: "codex"}, filepath.Join(dir, "control-api.json"), "codex"},
++		{"legacy-proxy", config.ProviderControlConfig{ConfigFile: filepath.Join(dir, "control-api.json"), App: "claude", ProxyProvider: "cc-switch"}, filepath.Join(dir, "control-api.json"), "claude"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			path, app, err := providerControlLocation(&tc.cfg)
++			if err != nil || path != tc.want || app != tc.app {
++				t.Fatalf("location=%q app=%q err=%v", path, app, err)
++			}
++		})
++	}
++	for _, cfg := range []config.ProviderControlConfig{{}, {App: "codex", AppType: "claude"}} {
++		if _, _, err := providerControlLocation(&cfg); err == nil {
++			t.Fatal("invalid configuration accepted")
++		}
++	}
++	if err := configureProviderControl(nil, nil); err != nil {
++		t.Fatal("absent integration must remain optional")
++	}
++}
+diff --git a/config.example.toml b/config.example.toml
+index e61aea9..233e11f 100644
+--- a/config.example.toml
++++ b/config.example.toml
+@@ -626,6 +626,17 @@ level = "info" # debug, info, warn, error
+ # exec = "npm run build"
+ # work_dir = "/path/to/project"  # Optional: override working directory / 可选：指定工作目录
+ 
++# [[commands]]
++# name = "ccs"
++# description = "Switch AI provider / 切换 AI 供应商"
++# exec = "pwsh -NoProfile -File $env:USERPROFILE\\.cc-connect\\scripts\\switch-provider.ps1 {{1:list}} {{2}} -AppType {{3:codex}}"
++# # Usage / 用法:
++# #   /ccs                              — list all providers / 列出所有供应商
++# #   /ccs list                         — list all providers / 列出所有供应商
++# #   /ccs switch <provider>            — switch to provider / 切换到指定供应商
++# #   /ccs list -AppType claude         — list providers for claude agent / 列出 claude 的供应商
++# #   /ccs switch <provider> -AppType claude  — switch claude's provider / 切换 claude 的供应商
++
+ #
+ # You can also add/remove commands at runtime via chat:
+ # 也可以在聊天中动态添加/删除命令：
+diff --git a/config/config.go b/config/config.go
+index 908027d..8447540 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -469,10 +469,11 @@ type ReferenceConfig struct {
+ 
+ // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
+ type ProjectConfig struct {
+-	Name    string `toml:"name"`
+-	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
+-	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
+-	SkipGit *bool  `toml:"skip_git,omitempty"`
++	ProviderControl *ProviderControlConfig `toml:"provider_control,omitempty"`
++	Name            string                 `toml:"name"`
++	Mode            string                 `toml:"mode,omitempty"`     // "" or "multi-workspace"
++	BaseDir         string                 `toml:"base_dir,omitempty"` // parent dir for workspaces
++	SkipGit         *bool                  `toml:"skip_git,omitempty"`
+ 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
+ 	// init flow to bind existing local directories. Default false keeps init
+ 	// limited to git URLs; use /workspace bind or /workspace route for explicit
+diff --git a/config/provider_control.go b/config/provider_control.go
+new file mode 100644
+index 0000000..2f53b7a
+--- /dev/null
++++ b/config/provider_control.go
+@@ -0,0 +1,12 @@
++package config
++
++// ProviderControlConfig enables the optional desktop proxy control bridge.
++// DBPath and AppType preserve older deployments; the database is never written
++// or used as the authoritative source of the desktop's current selection.
++type ProviderControlConfig struct {
++	ConfigFile    string `toml:"config_file,omitempty"`
++	App           string `toml:"app,omitempty"`
++	DBPath        string `toml:"db_path,omitempty"`
++	AppType       string `toml:"app_type,omitempty"`
++	ProxyProvider string `toml:"proxy_provider,omitempty"`
++}
+diff --git a/config/provider_control_test.go b/config/provider_control_test.go
+new file mode 100644
+index 0000000..432c3b8
+--- /dev/null
++++ b/config/provider_control_test.go
+@@ -0,0 +1,44 @@
++package config
++
++import (
++	"bytes"
++	"reflect"
++	"testing"
++
++	"github.com/BurntSushi/toml"
++)
++
++func TestProviderControlConfigRoundTripPreservesLegacyFields(t *testing.T) {
++	input := `[[projects]]
++name = "desktop"
++[projects.provider_control]
++config_file = "control-api.json"
++app = "claude"
++proxy_provider = "cc-switch"
++[[projects]]
++name = "coding"
++[projects.provider_control]
++db_path = "cc-switch.db"
++app_type = "codex"
++`
++	var cfg Config
++	if _, err := toml.Decode(input, &cfg); err != nil {
++		t.Fatal(err)
++	}
++	if len(cfg.Projects) != 2 || cfg.Projects[1].ProviderControl == nil {
++		t.Fatal("integration configuration was silently dropped")
++	}
++	var out bytes.Buffer
++	if err := toml.NewEncoder(&out).Encode(cfg); err != nil {
++		t.Fatal(err)
++	}
++	var reloaded Config
++	if _, err := toml.Decode(out.String(), &reloaded); err != nil {
++		t.Fatal(err)
++	}
++	for i := range cfg.Projects {
++		if !reflect.DeepEqual(cfg.Projects[i].ProviderControl, reloaded.Projects[i].ProviderControl) {
++			t.Fatal("configuration round trip lost provider control fields")
++		}
++	}
++}
+diff --git a/core/card.go b/core/card.go
+index 5e819f8..fa969cc 100644
+--- a/core/card.go
++++ b/core/card.go
+@@ -11,6 +11,9 @@ import (
+ type Card struct {
+ 	Header   *CardHeader
+ 	Elements []CardElement
++	// UpdateOnAction asks capable platforms to replace this card when a cmd:
++	// callback replies with another card. Commands still use normal authorization.
++	UpdateOnAction bool
+ }
+ 
+ // CardHeader is the optional colored title bar of a card.
+@@ -124,6 +127,12 @@ func NewCard() *CardBuilder {
+ 	return &CardBuilder{}
+ }
+ 
++// InPlace requests in-place replies to command callbacks on supported platforms.
++func (b *CardBuilder) InPlace() *CardBuilder {
++	b.card.UpdateOnAction = true
++	return b
++}
++
+ // Title sets the card header with a title and color.
+ func (b *CardBuilder) Title(title, color string) *CardBuilder {
+ 	b.card.Header = &CardHeader{Title: title, Color: color}
+diff --git a/core/ccs_picker.go b/core/ccs_picker.go
+new file mode 100644
+index 0000000..82f0dda
+--- /dev/null
++++ b/core/ccs_picker.go
+@@ -0,0 +1,474 @@
++package core
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"slices"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	ccsPickerTTL      = 10 * time.Minute
++	ccsPickerLimit    = 128
++	ccsPickerPageSize = 50
++)
++
++// Picker state is short-lived and memory-only. Callback values contain an opaque
++// nonce, never a model/provider name, credentials, or a persisted conversation ID.
++// Each view is single-use and bound to its requesting user AND conversation.
++// Selecting a dropdown only navigates; only the final Apply button can write.
++type ccsPickerState struct {
++	userID, sessionKey, scope string
++	view, providerID, model   string
++	modelBefore               string
++	fingerprint               [32]byte
++	catalog                   *ProviderCatalog
++	page                      int
++	created                   time.Time
++}
++
++func (e *Engine) ccsModelPickingAllowed(msg *Message) bool {
++	e.userRolesMu.RLock()
++	disabled, roles := e.disabledCmds, e.userRoles
++	e.userRolesMu.RUnlock()
++	if roles != nil {
++		if role := roles.ResolveRole(msg.UserID); role != nil {
++			disabled = role.DisabledCmds
++		}
++	}
++	return !disabled["model"]
++}
++
++func (e *Engine) replyCCSMenu(p Platform, msg *Message, catalog *ProviderCatalog, notice string) {
++	agent, _ := e.sessionContextForKey(msg.SessionKey)
++	switcher, ok := agent.(ModelSwitcher)
++	// Retain provider-only commands and text fallback for other agents/platforms.
++	if !ok || !supportsCards(p) || !e.ccsModelPickingAllowed(msg) {
++		e.replyWithCard(p, msg.ReplyCtx, e.renderProviderControlCard(catalog, notice))
++		return
++	}
++	e.clearCCSPickers(msg)
++	state := ccsPickerState{
++		userID: msg.UserID, sessionKey: msg.SessionKey,
++		scope: e.interactiveKeyForSessionKey(msg.SessionKey), view: "providers",
++		modelBefore: switcher.GetModel(), catalog: cloneCCSCatalog(catalog),
++		fingerprint: ccsCatalogFingerprint(catalog),
++	}
++	e.replyWithCard(p, msg.ReplyCtx, e.renderCCSPicker(state, notice))
++}
++
++func cloneCCSCatalog(catalog *ProviderCatalog) *ProviderCatalog {
++	out := *catalog
++	out.Providers = append([]ControlledProvider(nil), catalog.Providers...)
++	for i := range out.Providers {
++		out.Providers[i].Models = append([]string(nil), out.Providers[i].Models...)
++	}
++	return &out
++}
++
++func ccsCatalogFingerprint(catalog *ProviderCatalog) [32]byte {
++	stable := cloneCCSCatalog(catalog)
++	sort.Slice(stable.Providers, func(i, j int) bool { return stable.Providers[i].ID < stable.Providers[j].ID })
++	for i := range stable.Providers {
++		sort.Strings(stable.Providers[i].Models)
++	}
++	data, _ := json.Marshal(stable) // This public, concrete schema cannot fail to marshal.
++	return sha256.Sum256(data)
++}
++
++func (e *Engine) clearCCSPickers(msg *Message) {
++	e.ccsPickerMu.Lock()
++	defer e.ccsPickerMu.Unlock()
++	for token, state := range e.ccsPickers {
++		if state.userID == msg.UserID && state.sessionKey == msg.SessionKey {
++			delete(e.ccsPickers, token)
++		}
++	}
++}
++
++func (e *Engine) storeCCSPicker(state ccsPickerState) string {
++	var nonce [16]byte
++	if _, err := rand.Read(nonce[:]); err != nil {
++		slog.Error("ccs: cannot create picker nonce")
++		return ""
++	}
++	state.created = time.Now()
++	e.ccsPickerMu.Lock()
++	defer e.ccsPickerMu.Unlock()
++	if e.ccsPickers == nil {
++		e.ccsPickers = make(map[string]*ccsPickerState)
++	}
++	oldest := ""
++	for token, existing := range e.ccsPickers {
++		if state.created.Sub(existing.created) >= ccsPickerTTL {
++			delete(e.ccsPickers, token)
++			continue
++		}
++		if oldest == "" || existing.created.Before(e.ccsPickers[oldest].created) {
++			oldest = token
++		}
++	}
++	if len(e.ccsPickers) >= ccsPickerLimit {
++		delete(e.ccsPickers, oldest)
++	}
++	token := hex.EncodeToString(nonce[:])
++	e.ccsPickers[token] = &state
++	return token
++}
++
++func (e *Engine) takeCCSPicker(msg *Message, token string) (ccsPickerState, bool) {
++	e.ccsPickerMu.Lock()
++	defer e.ccsPickerMu.Unlock()
++	state := e.ccsPickers[token]
++	if state == nil || state.userID != msg.UserID || state.sessionKey != msg.SessionKey {
++		return ccsPickerState{}, false
++	}
++	delete(e.ccsPickers, token)
++	if time.Since(state.created) >= ccsPickerTTL {
++		return ccsPickerState{}, false
++	}
++	return *state, true
++}
++
++func (e *Engine) ccsInfoCard(text string) *Card {
++	return NewCard().InPlace().Title(e.i18n.Tf(MsgCCSPickerTitle, e.name), "blue").
++		Markdown(text).Buttons(DefaultBtn(e.i18n.T(MsgCCSRefresh), "cmd:/ccs")).Build()
++}
++
++func controlledProviderModels(provider ControlledProvider) []string {
++	var models []string
++	seen := make(map[string]bool)
++	for _, model := range append([]string{provider.Model}, provider.Models...) {
++		model = strings.TrimSpace(model)
++		if model != "" && len(model) <= 256 && !strings.ContainsAny(model, "\r\n\x00") && !seen[model] {
++			seen[model] = true
++			models = append(models, model)
++		}
++	}
++	return models
++}
++
++func ccsShortLabel(text string) string {
++	runes := []rune(text)
++	if len(runes) > 80 {
++		return string(runes[:79]) + "…"
++	}
++	return text
++}
++
++func ccsPickerAction(token, choice string) string { return "cmd:/ccs pick " + token + " " + choice }
++
++func (e *Engine) renderCCSPicker(state ccsPickerState, notice string) *Card {
++	token := e.storeCCSPicker(state)
++	if token == "" {
++		return e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired))
++	}
++	card := NewCard().InPlace().Title(e.i18n.Tf(MsgCCSPickerTitle, e.name), "blue").Markdown(notice)
++	current, ok := findControlledProvider(state.catalog, state.catalog.CurrentID)
++	currentName := e.i18n.T(MsgCCSNone)
++	if ok {
++		currentName = current.Name
++	}
++	model := state.modelBefore
++	if model == "" {
++		model = e.i18n.T(MsgCCSKeepModel)
++	}
++	card.Markdown(e.i18n.Tf(MsgCCSCurrent, currentName)).
++		Markdown(e.i18n.Tf(MsgCCSProjectModel, model)).Divider()
++	count := 0
++	switch state.view {
++	case "providers":
++		count = e.renderCCSProviderOptions(card, state, token)
++	case "models":
++		count = e.renderCCSModelOptions(card, state, token)
++	case "confirm":
++		provider, found := findControlledProvider(state.catalog, state.providerID)
++		if !found {
++			return e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired))
++		}
++		target := state.model
++		if target == "" {
++			target = e.i18n.T(MsgCCSKeepModel)
++		}
++		card.Markdown(e.i18n.Tf(MsgCCSConfirmChoice, provider.Name, target))
++		if !provider.Selectable {
++			card.Markdown(e.i18n.T(MsgCCSNotSelectable))
++		} else if !state.catalog.ProxyRunning || state.catalog.AutoFailover {
++			card.Markdown(e.i18n.T(MsgCCSBlocked))
++		} else {
++			card.Buttons(PrimaryBtn(e.i18n.T(MsgCCSApply), ccsPickerAction(token, "apply")))
++		}
++	}
++	if count > ccsPickerPageSize {
++		var pages []CardButton
++		if state.page > 0 {
++			pages = append(pages, DefaultBtn(e.i18n.T(MsgCardPrev), ccsPickerAction(token, "prev")))
++		}
++		if (state.page+1)*ccsPickerPageSize < count {
++			pages = append(pages, DefaultBtn(e.i18n.T(MsgCardNext), ccsPickerAction(token, "next")))
++		}
++		card.Buttons(pages...).Note(e.i18n.Tf(MsgCCSPage, state.page+1, (count+ccsPickerPageSize-1)/ccsPickerPageSize))
++	}
++	var nav []CardButton
++	if state.view != "providers" {
++		nav = append(nav, DefaultBtn(e.i18n.T(MsgCardBack), ccsPickerAction(token, "back")))
++	}
++	nav = append(nav, DefaultBtn(e.i18n.T(MsgCCSCancel), ccsPickerAction(token, "cancel")),
++		DefaultBtn(e.i18n.T(MsgCCSRefresh), ccsPickerAction(token, "refresh")))
++	return card.Buttons(nav...).Note(e.i18n.T(MsgCCSPickerScope)).Build()
++}
++
++func (e *Engine) renderCCSProviderOptions(card *CardBuilder, state ccsPickerState, token string) int {
++	card.Markdown(e.i18n.T(MsgCCSChooseProvider))
++	if !state.catalog.ProxyRunning || state.catalog.AutoFailover {
++		card.Markdown(e.i18n.T(MsgCCSBlocked))
++	}
++	providers := state.catalog.Providers
++	names := make(map[string]int)
++	for _, provider := range providers {
++		names[strings.ToLower(provider.Name)]++
++	}
++	var options []CardSelectOption
++	for i := state.page * ccsPickerPageSize; i < len(providers) && i < (state.page+1)*ccsPickerPageSize; i++ {
++		provider := providers[i]
++		label := provider.Name
++		if names[strings.ToLower(label)] > 1 {
++			// Keep duplicates distinguishable even when a long name is truncated.
++			label = fmt.Sprintf("%d · %s · %s", i+1, label, provider.ID)
++		}
++		if provider.ID == state.catalog.CurrentID {
++			label = "▶ " + label
++		}
++		options = append(options, CardSelectOption{Text: ccsShortLabel(label), Value: ccsPickerAction(token, fmt.Sprintf("provider:%d", i))})
++	}
++	if len(options) == 0 {
++		card.Markdown(e.i18n.T(MsgProviderListEmpty))
++	}
++	// No initial option: selecting the current provider must also open its models.
++	card.Select(e.i18n.T(MsgCCSProviderPlaceholder), options, "")
++	return len(providers)
++}
++
++func (e *Engine) renderCCSModelOptions(card *CardBuilder, state ccsPickerState, token string) int {
++	provider, ok := findControlledProvider(state.catalog, state.providerID)
++	if !ok {
++		card.Markdown(e.i18n.T(MsgCCSPickerExpired))
++		return 0
++	}
++	card.Markdown(e.i18n.Tf(MsgCCSChooseModel, provider.Name))
++	models := controlledProviderModels(provider)
++	var options []CardSelectOption
++	for i := state.page * ccsPickerPageSize; i < len(models) && i < (state.page+1)*ccsPickerPageSize; i++ {
++		label := models[i]
++		if provider.ID == state.catalog.CurrentID && models[i] == state.modelBefore {
++			label = "▶ " + label
++		}
++		options = append(options, CardSelectOption{Text: ccsShortLabel(label), Value: ccsPickerAction(token, fmt.Sprintf("model:%d", i))})
++	}
++	if len(models) == 0 {
++		card.Markdown(e.i18n.T(MsgCCSNoModels)).
++			Buttons(DefaultBtn(e.i18n.T(MsgCCSProviderOnly), ccsPickerAction(token, "provider-only")))
++	}
++	card.Select(e.i18n.T(MsgModelSelectPlaceholder), options, "")
++	return len(models)
++}
++
++func (e *Engine) cmdCCSPicker(p Platform, msg *Message, args []string) {
++	if len(args) != 2 {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired)))
++		return
++	}
++	state, ok := e.takeCCSPicker(msg, args[0])
++	if !ok {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired)))
++		return
++	}
++	if args[1] == "cancel" {
++		e.clearCCSPickers(msg)
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(MsgCCSCancelled)))
++		return
++	}
++	ctx, cancel := context.WithTimeout(e.ctx, 6*time.Second)
++	defer cancel()
++	if state.view == "confirm" && args[1] == "apply" {
++		e.applyCCSPicker(ctx, p, msg, state)
++		return
++	}
++	catalog, err := e.providerControl.Catalog(ctx)
++	if err != nil {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.Tf(MsgCCSUnavailable, err)))
++		return
++	}
++	if args[1] == "refresh" {
++		e.replyCCSMenu(p, msg, catalog, "")
++		return
++	}
++	agent, _ := e.sessionContextForKey(msg.SessionKey)
++	switcher, supported := agent.(ModelSwitcher)
++	if !supported || state.scope != e.interactiveKeyForSessionKey(msg.SessionKey) ||
++		state.modelBefore != switcher.GetModel() || state.fingerprint != ccsCatalogFingerprint(catalog) {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired)))
++		return
++	}
++	if !advanceCCSPicker(&state, args[1]) {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(MsgCCSPickerExpired)))
++		return
++	}
++	e.replyWithCard(p, msg.ReplyCtx, e.renderCCSPicker(state, ""))
++}
++
++func advanceCCSPicker(state *ccsPickerState, action string) bool {
++	provider, _ := findControlledProvider(state.catalog, state.providerID)
++	models := controlledProviderModels(provider)
++	count := len(state.catalog.Providers)
++	if state.view == "models" {
++		count = len(models)
++	}
++	switch action {
++	case "back":
++		if state.view == "confirm" {
++			state.view, state.model, state.page = "models", "", 0
++			return true
++		}
++		if state.view == "models" {
++			state.view, state.providerID, state.page = "providers", "", 0
++			return true
++		}
++	case "next", "prev":
++		if state.view != "providers" && state.view != "models" {
++			return false
++		}
++		next := state.page + 1
++		if action == "prev" {
++			next = state.page - 1
++		}
++		if next >= 0 && next*ccsPickerPageSize < count {
++			state.page = next
++			return true
++		}
++	case "provider-only":
++		if state.view == "models" && len(models) == 0 {
++			state.view, state.model = "confirm", ""
++			return true
++		}
++	default:
++		kind, raw, found := strings.Cut(action, ":")
++		index, err := strconv.Atoi(raw)
++		if !found || err != nil || index < state.page*ccsPickerPageSize || index >= (state.page+1)*ccsPickerPageSize {
++			return false
++		}
++		if kind == "provider" && state.view == "providers" && index < len(state.catalog.Providers) {
++			state.providerID = state.catalog.Providers[index].ID
++			state.view, state.page = "models", 0
++			return true
++		}
++		if kind == "model" && state.view == "models" && index < len(models) {
++			state.model, state.view = models[index], "confirm"
++			return true
++		}
++	}
++	return false
++}
++
++func (e *Engine) applyCCSPicker(ctx context.Context, p Platform, msg *Message, state ccsPickerState) {
++	replyError := func(key MsgKey) { e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.T(key))) }
++	if !e.ccsApplyMu.TryLock() {
++		replyError(MsgCCSBusy)
++		return
++	}
++	defer e.ccsApplyMu.Unlock()
++	// Read inside the apply lock, so another local selection cannot invalidate
++	// our preflight check while we wait. External desktop changes are still
++	// authoritative; the selection response must confirm the requested ID.
++	catalog, err := e.providerControl.Catalog(ctx)
++	if err != nil {
++		e.replyWithCard(p, msg.ReplyCtx, e.ccsInfoCard(e.i18n.Tf(MsgCCSUnavailable, err)))
++		return
++	}
++	if state.fingerprint != ccsCatalogFingerprint(catalog) {
++		replyError(MsgCCSPickerExpired)
++		return
++	}
++	provider, ok := findControlledProvider(catalog, state.providerID)
++	if !ok || !provider.Selectable {
++		replyError(MsgCCSNotSelectable)
++		return
++	}
++	if !catalog.ProxyRunning || catalog.AutoFailover {
++		replyError(MsgCCSBlocked)
++		return
++	}
++	if state.model != "" && !slices.Contains(controlledProviderModels(provider), state.model) {
++		replyError(MsgCCSPickerExpired)
++		return
++	}
++	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
++	if err != nil || interactiveKey != state.scope {
++		replyError(MsgCCSPickerExpired)
++		return
++	}
++	switcher, ok := agent.(ModelSwitcher)
++	if !ok || switcher.GetModel() != state.modelBefore {
++		replyError(MsgCCSPickerExpired)
++		return
++	}
++	// Do not interrupt a live turn. Hold the same lock normal messages use so
++	// a new turn cannot start between changing the proxy and changing the model.
++	session := sessions.GetOrCreateActive(msg.SessionKey)
++	if !session.TryLock() {
++		replyError(MsgCCSBusy)
++		return
++	}
++	defer session.UnlockWithoutUpdate()
++	if switcher.GetModel() != state.modelBefore || e.interactiveKeyForSessionKey(msg.SessionKey) != state.scope {
++		replyError(MsgCCSPickerExpired)
++		return
++	}
++	providerChanged := catalog.CurrentID != provider.ID
++	if providerChanged {
++		catalog, err = e.providerControl.Select(ctx, provider.ID)
++		if err != nil || catalog == nil || catalog.CurrentID != provider.ID {
++			replyError(MsgCCSUnconfirmed)
++			return
++		}
++	}
++	if err := e.applyCCSProjectModel(agent, sessions, interactiveKey, msg.SessionKey, state.model); err != nil {
++		// No cross-process transaction: report partial success, never blindly
++		// roll back a shared proxy that somebody else may now be using.
++		slog.Warn("ccs: project model update failed", "provider_changed", providerChanged)
++		key := MsgCCSModelApplyFailed
++		if providerChanged {
++			key = MsgCCSPartial
++		}
++		replyError(key)
++		return
++	}
++	model := switcher.GetModel()
++	if model == "" {
++		model = e.i18n.T(MsgCCSKeepModel)
++	}
++	e.replyCCSMenu(p, msg, catalog, e.i18n.Tf(MsgCCSPairSelected, provider.Name, model))
++}
++
++// applyCCSProjectModel follows /model persistence and native-resume semantics.
++func (e *Engine) applyCCSProjectModel(agent Agent, sessions *SessionManager, interactiveKey, sessionKey, target string) error {
++	if target == "" || agent.(ModelSwitcher).GetModel() == target {
++		return nil
++	}
++	if _, err := e.switchModelOnAgent(agent, target, agent == e.agent); err != nil {
++		return err
++	}
++	e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, target)
++	e.cleanupInteractiveState(interactiveKey)
++	// Never clear history or the native session ID when changing models.
++	sessions.Save()
++	return nil
++}
+diff --git a/core/ccs_picker_test.go b/core/ccs_picker_test.go
+new file mode 100644
+index 0000000..16d03b7
+--- /dev/null
++++ b/core/ccs_picker_test.go
+@@ -0,0 +1,827 @@
++package core
++
++import (
++	"context"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++	"unicode/utf8"
++)
++
++// These fixtures use only temporary files and a private HTTP server. They never
++// load a desktop control file, contact the real proxy, or start an agent process.
++type ccsPickerHTTP struct {
++	mu          sync.Mutex
++	catalog     *ProviderCatalog
++	posts       atomic.Int32
++	getStatus   int
++	postStatus  int
++	unconfirmed bool
++}
++
++func newCCSPickerHTTP(t *testing.T) (ProviderController, *ccsPickerHTTP) {
++	t.Helper()
++	f := &ccsPickerHTTP{catalog: &ProviderCatalog{
++		CurrentID: "a", ProxyRunning: true,
++		Providers: []ControlledProvider{
++			{ID: "a", Name: "Alpha", Model: "model-a", Models: []string{"model-a", "model-a-plus"}, Selectable: true},
++			{ID: "b", Name: "Beta", Model: "model-b", Models: []string{"model-b", "model-b-plus"}, Selectable: true},
++		},
++	}}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Authorization") != "Bearer "+strings.Repeat("a", 64) {
++			http.Error(w, "unauthorized", http.StatusUnauthorized)
++			return
++		}
++		f.mu.Lock()
++		defer f.mu.Unlock()
++		switch {
++		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers/test":
++			if f.getStatus != 0 {
++				http.Error(w, "fixture unavailable", f.getStatus)
++				return
++			}
++		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/providers/test/select":
++			f.posts.Add(1)
++			if f.postStatus != 0 {
++				http.Error(w, "fixture rejected selection", f.postStatus)
++				return
++			}
++			var input struct {
++				ID string `json:"id"`
++			}
++			if json.NewDecoder(r.Body).Decode(&input) != nil {
++				http.Error(w, "bad input", http.StatusBadRequest)
++				return
++			}
++			if _, ok := findControlledProvider(f.catalog, input.ID); !ok {
++				http.NotFound(w, r)
++				return
++			}
++			if !f.unconfirmed {
++				f.catalog.CurrentID = input.ID
++			}
++		default:
++			http.NotFound(w, r)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(f.catalog)
++	}))
++	t.Cleanup(server.Close)
++	control, _ := controlForServer(t, server)
++	return control, f
++}
++
++func (f *ccsPickerHTTP) change(fn func(*ProviderCatalog)) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	fn(f.catalog)
++}
++
++type ccsPickerAgent struct {
++	stubAgent
++	mu    sync.Mutex
++	model string
++}
++
++func (a *ccsPickerAgent) SetModel(model string) { a.mu.Lock(); defer a.mu.Unlock(); a.model = model }
++func (a *ccsPickerAgent) GetModel() string      { a.mu.Lock(); defer a.mu.Unlock(); return a.model }
++func (a *ccsPickerAgent) AvailableModels(context.Context) []ModelOption {
++	// The picker must use the selected desktop provider's catalog, not this list.
++	return []ModelOption{{Name: "unrelated-agent-model"}}
++}
++
++type ccsPickerEnv struct {
++	t     *testing.T
++	e     *Engine
++	p     *stubCardPlatform
++	a     *ccsPickerAgent
++	f     *ccsPickerHTTP
++	msg   *Message
++	path  string
++	saves atomic.Int32
++}
++
++func newCCSPickerEnv(t *testing.T) *ccsPickerEnv {
++	t.Helper()
++	a := &ccsPickerAgent{model: "model-a"}
++	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
++	path := filepath.Join(t.TempDir(), "sessions.json")
++	e := NewEngine("test", a, []Platform{p}, path, LangEnglish)
++	t.Cleanup(e.cancel)
++	control, f := newCCSPickerHTTP(t)
++	e.SetProviderControl(control)
++	env := &ccsPickerEnv{t: t, e: e, p: p, a: a, f: f, path: path,
++		msg: &Message{SessionKey: "test:picker-user", UserID: "picker-user", Platform: "test", ReplyCtx: "ctx"}}
++	e.modelSaveFunc = func(string) error { env.saves.Add(1); return nil }
++	return env
++}
++
++func lastCCSCard(t *testing.T, p *stubCardPlatform) *Card {
++	t.Helper()
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if len(p.repliedCards) == 0 {
++		t.Fatal("no card reply")
++	}
++	return p.repliedCards[len(p.repliedCards)-1]
++}
++
++func ccsCardCommands(card *Card) []string {
++	var out []string
++	for _, element := range card.Elements {
++		switch elem := element.(type) {
++		case CardSelect:
++			for _, option := range elem.Options {
++				out = append(out, option.Value)
++			}
++		case CardActions:
++			for _, button := range elem.Buttons {
++				out = append(out, button.Value)
++			}
++		case CardListItem:
++			out = append(out, elem.BtnValue)
++		}
++	}
++	return out
++}
++
++func ccsCardCommand(t *testing.T, card *Card, action string) string {
++	t.Helper()
++	for _, value := range ccsCardCommands(card) {
++		if strings.HasSuffix(value, " "+action) {
++			return strings.TrimPrefix(value, "cmd:")
++		}
++	}
++	t.Fatalf("missing %q in card: %s", action, card.RenderText())
++	return ""
++}
++
++func ccsCardSelect(t *testing.T, card *Card) CardSelect {
++	t.Helper()
++	for _, element := range card.Elements {
++		if selectElem, ok := element.(CardSelect); ok {
++			return selectElem
++		}
++	}
++	t.Fatal("missing dropdown: ", card.RenderText())
++	return CardSelect{}
++}
++
++func (env *ccsPickerEnv) command(command string) *Card {
++	env.t.Helper()
++	if !env.e.handleCommand(env.p, env.msg, command) {
++		env.t.Fatal("command was not handled: ", command)
++	}
++	return lastCCSCard(env.t, env.p)
++}
++
++func (env *ccsPickerEnv) choose(action string) *Card {
++	env.t.Helper()
++	return env.command(ccsCardCommand(env.t, lastCCSCard(env.t, env.p), action))
++}
++
++func (env *ccsPickerEnv) confirm(provider, model int) string {
++	env.t.Helper()
++	env.command("/ccs")
++	env.choose(fmt.Sprintf("provider:%d", provider))
++	env.choose(fmt.Sprintf("model:%d", model))
++	return ccsCardCommand(env.t, lastCCSCard(env.t, env.p), "apply")
++}
++
++func (env *ccsPickerEnv) assertUnchanged() {
++	env.t.Helper()
++	if env.f.posts.Load() != 0 || env.saves.Load() != 0 || env.a.GetModel() != "model-a" {
++		env.t.Fatalf("unexpected writes: posts=%d saves=%d model=%s", env.f.posts.Load(), env.saves.Load(), env.a.GetModel())
++	}
++}
++
++func TestCCSPickerBrowseConfirmPreservesHistoryAndNativeResume(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	session := env.e.sessions.GetOrCreateActive(env.msg.SessionKey)
++	session.SetAgentSessionID("native-resume-fixture", "stub")
++	session.AddHistory("user", "keep this fixture history")
++	session.AddHistory("assistant", "remembered")
++	history := session.GetHistory(0)
++	env.e.sessions.Save()
++	before, err := os.ReadFile(env.path)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	card := env.command("/ccs")
++	if !card.UpdateOnAction || len(ccsCardSelect(t, card).Options) != 2 {
++		t.Fatal("expected an in-place provider dropdown")
++	}
++	if ccsCardSelect(t, card).InitValue != "" {
++		t.Fatal("current provider must remain selectable")
++	}
++	card = env.choose("provider:1")
++	models := ccsCardSelect(t, card)
++	if len(models.Options) != 2 || strings.Contains(card.RenderText(), "unrelated-agent-model") {
++		t.Fatal("models did not come from the selected provider")
++	}
++	card = env.choose("model:1")
++	if !strings.Contains(card.RenderText(), "model-b-plus") || !strings.Contains(card.RenderText(), "Beta") {
++		t.Fatal("confirmation does not show the pending pair")
++	}
++	env.assertUnchanged()
++	afterBrowse, err := os.ReadFile(env.path)
++	if err != nil || string(before) != string(afterBrowse) {
++		t.Fatal("browsing changed the session store")
++	}
++
++	card = env.choose("apply")
++	if env.f.posts.Load() != 1 || env.saves.Load() != 1 || env.a.GetModel() != "model-b-plus" {
++		t.Fatalf("wrong confirmed selection: posts=%d saves=%d model=%s", env.f.posts.Load(), env.saves.Load(), env.a.GetModel())
++	}
++	if !strings.Contains(card.RenderText(), "Applied · Provider: Beta · Project model: model-b-plus") {
++		t.Fatal(card.RenderText())
++	}
++	if !card.UpdateOnAction {
++		t.Fatal("workspace/card rendering dropped the in-place flag")
++	}
++	for _, store := range []*SessionManager{env.e.sessions, NewSessionManager(env.path)} {
++		s := store.GetOrCreateActive(env.msg.SessionKey)
++		// Compare serialized history: disk reload intentionally strips the
++		// monotonic portion of time.Time, which reflect.DeepEqual would reject.
++		wantHistory, _ := json.Marshal(history)
++		gotHistory, _ := json.Marshal(s.GetHistory(0))
++		if s.GetAgentSessionID() != "native-resume-fixture" || string(gotHistory) != string(wantHistory) {
++			t.Fatal("selection lost history or native resume ID")
++		}
++	}
++	if session.Busy() {
++		t.Fatal("apply left the conversation locked")
++	}
++}
++
++func TestCCSPickerSameProviderChangesOnlyProjectModel(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	card := env.command(env.confirm(0, 1))
++	if env.f.posts.Load() != 0 || env.saves.Load() != 1 || env.a.GetModel() != "model-a-plus" {
++		t.Fatal("same-provider model selection unnecessarily changed the desktop")
++	}
++	if !strings.Contains(card.RenderText(), "Project model: model-a-plus") {
++		t.Fatal(card.RenderText())
++	}
++}
++
++func TestCCSPickerBackRefreshAndCancelAreReadOnly(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	env.confirm(1, 1)
++	card := env.choose("back")
++	if !strings.Contains(card.RenderText(), "Choose a model for Beta") {
++		t.Fatal(card.RenderText())
++	}
++	card = env.choose("back")
++	if !strings.Contains(card.RenderText(), "Choose a provider") {
++		t.Fatal(card.RenderText())
++	}
++	env.choose("refresh")
++	card = env.choose("cancel")
++	if !strings.Contains(card.RenderText(), "Cancelled") {
++		t.Fatal(card.RenderText())
++	}
++	env.assertUnchanged()
++}
++
++func TestCCSPickerRejectsStaleConfirmations(t *testing.T) {
++	for _, scenario := range []string{"expired", "reopened", "current-provider", "catalog-model", "project-model", "workspace"} {
++		t.Run(scenario, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			command := env.confirm(1, 1)
++			switch scenario {
++			case "expired":
++				token := strings.Fields(command)[2]
++				env.e.ccsPickerMu.Lock()
++				env.e.ccsPickers[token].created = time.Now().Add(-ccsPickerTTL - time.Second)
++				env.e.ccsPickerMu.Unlock()
++			case "reopened":
++				env.command("/cc-switch current")
++			case "current-provider":
++				env.f.change(func(c *ProviderCatalog) { c.CurrentID = "b" })
++			case "catalog-model":
++				env.f.change(func(c *ProviderCatalog) { c.Providers[1].Models = []string{"replacement"} })
++			case "project-model":
++				env.a.SetModel("changed-elsewhere")
++			case "workspace":
++				env.e.bindSendWorkDir(env.msg.SessionKey, t.TempDir())
++			}
++			card := env.command(command)
++			if !strings.Contains(card.RenderText(), "expired") || env.f.posts.Load() != 0 || env.saves.Load() != 0 {
++				t.Fatal("stale confirmation was not rejected: ", card.RenderText())
++			}
++		})
++	}
++}
++
++func TestCCSPickerForeignCallbackCannotConsumeOwnerToken(t *testing.T) {
++	for _, field := range []string{"user", "session"} {
++		t.Run(field, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			command := env.confirm(1, 1)
++			other := *env.msg
++			if field == "user" {
++				other.UserID = "other-user"
++			} else {
++				other.SessionKey = "test:other-conversation"
++			}
++			env.e.handleCommand(env.p, &other, command)
++			env.assertUnchanged()
++			if !strings.Contains(lastCCSCard(t, env.p).RenderText(), "expired") {
++				t.Fatal("foreign callback accepted")
++			}
++			env.command(command)
++			if env.f.posts.Load() != 1 {
++				t.Fatal("foreign callback consumed the owner's token")
++			}
++		})
++	}
++}
++
++func TestCCSPickerRepeatedApplyWritesAtMostOnce(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	command := env.confirm(1, 1)
++	var wg sync.WaitGroup
++	for range 4 {
++		wg.Add(1)
++		go func() { defer wg.Done(); env.e.handleCommand(env.p, env.msg, command) }()
++	}
++	wg.Wait()
++	if env.f.posts.Load() != 1 || env.saves.Load() != 1 {
++		t.Fatal("a repeated callback applied more than once")
++	}
++}
++
++func TestCCSPickerRejectsBusyConversationOrSelection(t *testing.T) {
++	for _, scenario := range []string{"conversation", "selection", "direct-command"} {
++		t.Run(scenario, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			command := env.confirm(1, 1)
++			if scenario == "conversation" {
++				session := env.e.sessions.GetOrCreateActive(env.msg.SessionKey)
++				if !session.TryLock() {
++					t.Fatal("fixture session is already busy")
++				}
++				defer session.UnlockWithoutUpdate()
++			} else {
++				env.e.ccsApplyMu.Lock()
++				defer env.e.ccsApplyMu.Unlock()
++			}
++			if scenario == "direct-command" {
++				env.e.handleCommand(env.p, env.msg, "/ccs switch Beta")
++				if !strings.Contains(strings.Join(env.p.getSent(), "\n"), "still in progress") {
++					t.Fatal(env.p.getSent())
++				}
++			} else if card := env.command(command); !strings.Contains(card.RenderText(), "still in progress") {
++				t.Fatal(card.RenderText())
++			}
++			env.assertUnchanged()
++		})
++	}
++}
++
++func TestCCSPickerDisabledCommandsAndRolesGateCallbacks(t *testing.T) {
++	for _, disabled := range []string{"provider", "model", "ccs", "cc-switch"} {
++		for _, rolePolicy := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/role=%t", disabled, rolePolicy), func(t *testing.T) {
++				env := newCCSPickerEnv(t)
++				command := env.confirm(1, 1)
++				if rolePolicy {
++					roles := NewUserRoleManager()
++					roles.Configure("", []RoleInput{{Name: "restricted", UserIDs: []string{env.msg.UserID}, DisabledCommands: []string{disabled}}})
++					env.e.SetUserRoles(roles)
++				} else {
++					env.e.SetDisabledCommands([]string{disabled})
++				}
++				env.e.handleCommand(env.p, env.msg, command)
++				if !strings.Contains(strings.Join(env.p.getSent(), "\n"), "disabled") {
++					t.Fatal("callback bypassed command policy")
++				}
++				env.assertUnchanged()
++			})
++		}
++	}
++}
++
++func TestCCSPickerProxyAndSelectableGuards(t *testing.T) {
++	for _, scenario := range []string{"stopped", "failover", "unselectable"} {
++		t.Run(scenario, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			env.f.change(func(c *ProviderCatalog) {
++				switch scenario {
++				case "stopped":
++					c.ProxyRunning = false
++				case "failover":
++					c.AutoFailover = true
++				case "unselectable":
++					c.Providers[1].Selectable = false
++				}
++			})
++			env.command("/ccs")
++			env.choose("provider:1")
++			card := env.choose("model:1")
++			for _, command := range ccsCardCommands(card) {
++				if strings.HasSuffix(command, " apply") {
++					t.Fatal("blocked selection advertises Apply")
++				}
++			}
++			// A forged Apply must still be checked, not just hidden in the UI.
++			command := strings.TrimSuffix(ccsCardCommand(t, card, "cancel"), "cancel") + "apply"
++			card = env.command(command)
++			want := env.e.i18n.T(MsgCCSBlocked)
++			if scenario == "unselectable" {
++				want = env.e.i18n.T(MsgCCSNotSelectable)
++			}
++			if !strings.Contains(card.RenderText(), want) {
++				t.Fatal(card.RenderText())
++			}
++			env.assertUnchanged()
++		})
++	}
++}
++
++func TestCCSPickerProviderOnlyWhenCatalogHasNoModels(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	env.f.change(func(c *ProviderCatalog) { c.Providers[1].Model = ""; c.Providers[1].Models = nil })
++	env.command("/ccs")
++	card := env.choose("provider:1")
++	if !strings.Contains(card.RenderText(), "no configured models") {
++		t.Fatal(card.RenderText())
++	}
++	for _, elem := range card.Elements {
++		if _, ok := elem.(CardSelect); ok {
++			t.Fatal("invented a model list")
++		}
++	}
++	env.choose("provider-only")
++	env.assertUnchanged()
++	env.choose("apply")
++	if env.f.posts.Load() != 1 || env.saves.Load() != 0 || env.a.GetModel() != "model-a" {
++		t.Fatal("provider-only selection changed the model")
++	}
++}
++
++func TestCCSPickerModelSaveFailureDoesNotHidePartialResult(t *testing.T) {
++	for _, provider := range []int{0, 1} {
++		t.Run(fmt.Sprintf("provider:%d", provider), func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			env.e.modelSaveFunc = func(string) error { return errors.New("fixture save failed") }
++			card := env.command(env.confirm(provider, 1))
++			want := "The project model could not be saved"
++			if provider == 1 {
++				want = "The provider changed, but the project model could not be saved"
++			}
++			if !strings.Contains(card.RenderText(), want) || strings.Contains(card.RenderText(), "Applied ·") {
++				t.Fatal(card.RenderText())
++			}
++			if env.f.posts.Load() != int32(provider) || env.a.GetModel() != "model-a" {
++				t.Fatal("unexpected rollback or failed model applied")
++			}
++		})
++	}
++}
++
++func TestCCSPickerUnconfirmedProviderNeverChangesModel(t *testing.T) {
++	for _, scenario := range []string{"error", "wrong-current"} {
++		t.Run(scenario, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			command := env.confirm(1, 1)
++			env.f.mu.Lock()
++			if scenario == "error" {
++				env.f.postStatus = 500
++			} else {
++				env.f.unconfirmed = true
++			}
++			env.f.mu.Unlock()
++			card := env.command(command)
++			if !strings.Contains(card.RenderText(), "did not confirm") || env.saves.Load() != 0 || env.a.GetModel() != "model-a" {
++				t.Fatal("model changed without confirmed provider: ", card.RenderText())
++			}
++		})
++	}
++}
++
++func TestCCSPickerCatalogReorderingIsHarmless(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	command := env.confirm(1, 1)
++	env.f.change(func(c *ProviderCatalog) {
++		c.Providers[0], c.Providers[1] = c.Providers[1], c.Providers[0]
++		c.Providers[0].Models[0], c.Providers[0].Models[1] = c.Providers[0].Models[1], c.Providers[0].Models[0]
++	})
++	env.command(command)
++	if env.f.posts.Load() != 1 || env.a.GetModel() != "model-b-plus" {
++		t.Fatal("catalog ordering changed the indexed selection")
++	}
++}
++
++func TestCCSPickerPaginationAndOpaqueCallbacks(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	env.f.change(func(c *ProviderCatalog) {
++		c.Providers = nil
++		for i := range 51 {
++			models := []string{}
++			for j := range 51 {
++				models = append(models, fmt.Sprintf("vendor/model-%d", j))
++			}
++			c.Providers = append(c.Providers, ControlledProvider{ID: fmt.Sprintf("provider-%d", i), Name: strings.Repeat("供应商", 35), Models: models, Selectable: true})
++		}
++		c.CurrentID = "provider-0"
++	})
++	card := env.command("/ccs")
++	selectElem := ccsCardSelect(t, card)
++	if len(selectElem.Options) != 50 || selectElem.Options[0].Text == selectElem.Options[1].Text {
++		t.Fatal("invalid provider page or indistinguishable duplicate names")
++	}
++	check := func(card *Card) {
++		t.Helper()
++		for _, command := range ccsCardCommands(card) {
++			if len(command) > 64 || strings.Contains(command, "vendor/") || strings.Contains(command, "供应商") {
++				t.Fatalf("unsafe callback %q", command)
++			}
++		}
++		for _, option := range ccsCardSelect(t, card).Options {
++			if utf8.RuneCountInString(option.Text) > 80 {
++				t.Fatal("option label exceeds limit")
++			}
++		}
++	}
++	check(card)
++	card = env.choose("next")
++	if len(ccsCardSelect(t, card).Options) != 1 {
++		t.Fatal("wrong second provider page")
++	}
++	card = env.choose("provider:50")
++	check(card)
++	card = env.choose("next")
++	if len(ccsCardSelect(t, card).Options) != 1 {
++		t.Fatal("wrong second model page")
++	}
++	env.choose("prev")
++	env.choose("next")
++	card = env.choose("model:50")
++	if !strings.Contains(card.RenderText(), "vendor/model-50") {
++		t.Fatal("wrong paginated model")
++	}
++	env.assertUnchanged()
++}
++
++func TestCCSPickerTreatsSpecialModelNamesAsLiterals(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	model := `vendor/a model "quoted"; /model switch not-a-command`
++	env.f.change(func(c *ProviderCatalog) { c.Providers[1].Models = []string{model} })
++	env.command(env.confirm(1, 1))
++	if env.a.GetModel() != model || env.saves.Load() != 1 {
++		t.Fatal("model label was parsed as a command instead of a literal")
++	}
++}
++
++func TestCCSPickerTokenStoreIsBoundedExpiringAndSingleUse(t *testing.T) {
++	e := newTestEngine()
++	defer e.cancel()
++	msg := &Message{UserID: "u", SessionKey: "test:u"}
++	tokens := map[string]bool{}
++	last := ""
++	for range ccsPickerLimit + 3 {
++		last = e.storeCCSPicker(ccsPickerState{userID: msg.UserID, sessionKey: msg.SessionKey})
++		decoded, err := hex.DecodeString(last)
++		if err != nil || len(decoded) != 16 || tokens[last] {
++			t.Fatal("invalid or repeated nonce")
++		}
++		tokens[last] = true
++	}
++	if len(e.ccsPickers) != ccsPickerLimit {
++		t.Fatal("unbounded picker cache")
++	}
++	if _, ok := e.takeCCSPicker(msg, last); !ok {
++		t.Fatal("fresh token rejected")
++	}
++	if _, ok := e.takeCCSPicker(msg, last); ok {
++		t.Fatal("token reused")
++	}
++	for _, state := range e.ccsPickers {
++		state.created = time.Now().Add(-ccsPickerTTL)
++	}
++	e.storeCCSPicker(ccsPickerState{userID: msg.UserID, sessionKey: msg.SessionKey})
++	if len(e.ccsPickers) != 1 {
++		t.Fatal("expired states were not pruned")
++	}
++}
++
++// CUJ boundary doubles: card text is recorded as the message a user sees, and
++// the fake agent reports its actual runtime model on the next conversation turn.
++type ccsCUJPlatform struct{ *stubCardPlatform }
++
++func (p *ccsCUJPlatform) ReplyCard(ctx context.Context, rctx any, card *Card) error {
++	if err := p.stubCardPlatform.ReplyCard(ctx, rctx, card); err != nil {
++		return err
++	}
++	return p.stubPlatformEngine.Reply(ctx, rctx, card.RenderText())
++}
++
++func (p *ccsCUJPlatform) SendCard(ctx context.Context, rctx any, card *Card) error {
++	if err := p.stubCardPlatform.SendCard(ctx, rctx, card); err != nil {
++		return err
++	}
++	return p.stubPlatformEngine.Send(ctx, rctx, card.RenderText())
++}
++
++type ccsCUJAgent struct {
++	*cujAgent
++	model     ccsPickerAgent
++	resumeMu  sync.Mutex
++	resumeIDs []string
++}
++
++func (a *ccsCUJAgent) SetModel(model string) { a.model.SetModel(model) }
++func (a *ccsCUJAgent) GetModel() string      { return a.model.GetModel() }
++func (a *ccsCUJAgent) AvailableModels(ctx context.Context) []ModelOption {
++	return a.model.AvailableModels(ctx)
++}
++func (a *ccsCUJAgent) StartSession(ctx context.Context, resume string) (AgentSession, error) {
++	a.resumeMu.Lock()
++	a.resumeIDs = append(a.resumeIDs, resume)
++	a.resumeMu.Unlock()
++	s, err := a.cujAgent.StartSession(ctx, resume)
++	if err != nil {
++		return nil, err
++	}
++	session := s.(*cujAgentSession)
++	session.mu.Lock()
++	session.reply = "model in use: " + a.GetModel()
++	session.mu.Unlock()
++	return session, nil
++}
++func (a *ccsCUJAgent) lastResumeID() string {
++	a.resumeMu.Lock()
++	defer a.resumeMu.Unlock()
++	if len(a.resumeIDs) == 0 {
++		return ""
++	}
++	return a.resumeIDs[len(a.resumeIDs)-1]
++}
++
++func TestCCSPickerProviderOnlyFallbacks(t *testing.T) {
++	for _, scenario := range []string{"unsupported-agent", "plain-text-platform", "model-disabled"} {
++		t.Run(scenario, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			if scenario == "unsupported-agent" {
++				env.e.agent = &stubAgent{}
++			}
++			if scenario == "model-disabled" {
++				env.e.SetDisabledCommands([]string{"model"})
++			}
++			if scenario == "plain-text-platform" {
++				p := &stubPlatformEngine{n: "test"}
++				env.e.handleCommand(p, env.msg, "/ccs")
++				if !strings.Contains(strings.Join(p.getSent(), "\n"), "Desktop selection: Alpha") {
++					t.Fatal(p.getSent())
++				}
++			} else {
++				card := env.command("/ccs")
++				for _, element := range card.Elements {
++					if _, ok := element.(CardSelect); ok {
++						t.Fatal("model picker shown without model capability or permission")
++					}
++				}
++				if !strings.Contains(card.RenderText(), "Desktop selection: Alpha") {
++					t.Fatal(card.RenderText())
++				}
++			}
++			env.assertUnchanged()
++		})
++	}
++}
++
++func TestCCSPickerEmptyCatalogAndNoOpSelection(t *testing.T) {
++	t.Run("empty", func(t *testing.T) {
++		env := newCCSPickerEnv(t)
++		env.f.change(func(c *ProviderCatalog) { c.Providers = []ControlledProvider{}; c.CurrentID = "" })
++		card := env.command("/ccs")
++		for _, element := range card.Elements {
++			if _, ok := element.(CardSelect); ok {
++				t.Fatal("empty dropdown rendered")
++			}
++		}
++		if !strings.Contains(card.RenderText(), env.e.i18n.T(MsgProviderListEmpty)) {
++			t.Fatal(card.RenderText())
++		}
++		env.choose("cancel")
++		env.assertUnchanged()
++	})
++	t.Run("no-op", func(t *testing.T) {
++		env := newCCSPickerEnv(t)
++		card := env.command(env.confirm(0, 0))
++		if !strings.Contains(card.RenderText(), "Applied · Provider: Alpha · Project model: model-a") {
++			t.Fatal(card.RenderText())
++		}
++		env.assertUnchanged()
++	})
++}
++
++func TestCCSPickerCatalogFailureBlocksApplyButNotCancel(t *testing.T) {
++	for _, action := range []string{"apply", "cancel"} {
++		t.Run(action, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			env.confirm(1, 1)
++			env.f.mu.Lock()
++			env.f.getStatus = 500
++			env.f.mu.Unlock()
++			card := env.choose(action)
++			want := "unavailable"
++			if action == "cancel" {
++				want = "Cancelled"
++			}
++			if !strings.Contains(card.RenderText(), want) {
++				t.Fatal(card.RenderText())
++			}
++			env.assertUnchanged()
++		})
++	}
++}
++
++func TestCCSPickerRejectsForgedNavigation(t *testing.T) {
++	for _, action := range []string{"apply", "model:0", "provider:-1", "provider:2", "provider:999999999999999999999999", "next", "prev", "back", "provider-only", "nonsense", "cancel extra"} {
++		t.Run(action, func(t *testing.T) {
++			env := newCCSPickerEnv(t)
++			card := env.command("/ccs")
++			command := strings.TrimSuffix(ccsCardCommand(t, card, "cancel"), "cancel") + action
++			card = env.command(command)
++			if !strings.Contains(card.RenderText(), "expired") {
++				t.Fatal("invalid navigation accepted: ", card.RenderText())
++			}
++			env.assertUnchanged()
++		})
++	}
++}
++
++func TestCCSPickerReusesActiveAgentProviderModelPersistence(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	a := &stubModelModeAgent{model: "model-a", active: "proxy", providers: []ProviderConfig{{Name: "proxy", Model: "model-a"}}}
++	env.e.agent = a
++	savedName, savedModel := "", ""
++	env.e.providerModelSaveFunc = func(name, model string) error { savedName, savedModel = name, model; return nil }
++	env.command(env.confirm(1, 1))
++	if savedName != "proxy" || savedModel != "model-b-plus" || a.GetModel() != "model-b-plus" || a.GetActiveProvider().Model != "model-b-plus" {
++		t.Fatal("picker bypassed existing agent-provider model persistence")
++	}
++	if env.saves.Load() != 0 {
++		t.Fatal("saved a second, unrelated global model")
++	}
++}
++
++func TestCCSPickerTranslationsCoverAllSupportedLanguages(t *testing.T) {
++	keys := []MsgKey{MsgCCSNotSelectable, MsgCCSPickerTitle, MsgCCSPickerExpired, MsgCCSKeepModel, MsgCCSProjectModel, MsgCCSConfirmChoice,
++		MsgCCSApply, MsgCCSPage, MsgCCSCancel, MsgCCSPickerScope, MsgCCSChooseProvider, MsgCCSProviderPlaceholder,
++		MsgCCSChooseModel, MsgCCSNoModels, MsgCCSProviderOnly, MsgCCSCancelled, MsgCCSBusy, MsgCCSPartial,
++		MsgCCSModelApplyFailed, MsgCCSPairSelected}
++	for _, key := range keys {
++		for _, language := range []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish} {
++			if messages[key][language] == "" {
++				t.Errorf("missing %s translation for %s", language, key)
++			}
++		}
++	}
++}
++
++func TestCCSPickerUsesBoundWorkspaceModelAndPreservesBothHistories(t *testing.T) {
++	env := newCCSPickerEnv(t)
++	env.e.SetMultiWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "bindings.json"))
++	statePath := filepath.Join(t.TempDir(), "project-state.json")
++	env.e.SetProjectStateStore(NewProjectStateStore(statePath))
++	workspace := normalizeWorkspacePath(t.TempDir())
++	env.e.workspaceBindings.Bind("project:test", "C-ccs-model", "channel", workspace)
++	env.msg.SessionKey = "feishu:C-ccs-model:picker-user"
++	ws := env.e.workspacePool.GetOrCreate(workspace)
++	wsAgent := &ccsPickerAgent{model: "model-a"}
++	ws.agent = wsAgent
++	ws.sessions = NewSessionManager(filepath.Join(t.TempDir(), "workspace-sessions.json"))
++	globalSession := env.e.sessions.GetOrCreateActive(env.msg.SessionKey)
++	globalSession.SetAgentSessionID("global-native-id", "stub")
++	globalSession.AddHistory("user", "global history fixture")
++	wsSession := ws.sessions.GetOrCreateActive(env.msg.SessionKey)
++	wsSession.SetAgentSessionID("workspace-native-id", "stub")
++	wsSession.AddHistory("user", "workspace history fixture")
++	env.command(env.confirm(1, 1))
++	if wsAgent.GetModel() != "model-b-plus" || env.a.GetModel() != "model-a" || env.saves.Load() != 0 {
++		t.Fatal("workspace selection changed the global project model")
++	}
++	if got := NewProjectStateStore(statePath).WorkspaceModelOverride(workspace); got != "model-b-plus" {
++		t.Fatalf("workspace override not persisted: %q", got)
++	}
++	if globalSession.GetAgentSessionID() != "global-native-id" || wsSession.GetAgentSessionID() != "workspace-native-id" ||
++		len(globalSession.GetHistory(0)) != 1 || len(wsSession.GetHistory(0)) != 1 {
++		t.Fatal("model picker reset global or workspace conversation history")
++	}
++}
+diff --git a/core/cuj_test.go b/core/cuj_test.go
+index f62495f..e7aee9b 100644
+--- a/core/cuj_test.go
++++ b/core/cuj_test.go
+@@ -1737,12 +1737,181 @@ func TestCUJ_E6_TimerSurvivesRestart(t *testing.T) {
+ // CUJ-F1 · /provider switches LLM provider for the next message — provider
+ // management lives outside core/engine.go (per-agent). Linked.
+ func TestCUJ_F1_ProviderSwitchLinkedToAgent(t *testing.T) {
++	t.Run("CCSDesktopSwitchPreservesConversation", func(t *testing.T) {
++		env := newCUJEnv(t)
++		defer env.engine.cancel()
++		control, _ := newCCSFixture(t)
++		env.engine.SetProviderControl(control)
++		key := env.userSends("ccs-user", "remember this conversation")
++		env.waitFor("initial conversation", 2*time.Second, func() bool {
++			s := env.engine.sessions.GetOrCreateActive(key)
++			return !s.Busy() && len(s.GetHistory(0)) >= 2
++		})
++		env.plat.clearSent()
++		env.userSends("ccs-user", "/ccs")
++		if !env.sentContains("Desktop selection: Alpha") {
++			t.Fatal(env.plat.getSent())
++		}
++		env.plat.clearSent()
++		env.userSends("ccs-user", "/ccs switch Beta")
++		if !env.sentContains("Desktop selection: Beta") {
++			t.Fatal(env.plat.getSent())
++		}
++		env.plat.clearSent()
++		env.userSends("ccs-user", "/ccs list")
++		if !env.sentContains("Desktop selection: Beta") {
++			t.Fatal(env.plat.getSent())
++		}
++		env.plat.clearSent()
++		env.userSends("ccs-user", "/history")
++		if !env.sentContains("remember this conversation") {
++			t.Fatal("switching lost conversation history:", env.plat.getSent())
++		}
++	})
+ 	t.Log("CUJ-F1: provider switching is per-agent; covered by agent/*_test.go provider tests")
+ }
+ 
+ // CUJ-F2 · /model switches model — same pattern as F1, agent-managed.
+ func TestCUJ_F2_ModelSwitchLinkedToAgent(t *testing.T) {
+-	t.Log("CUJ-F2: model switching is per-agent; covered by agent/*_test.go model tests")
++	for _, apply := range []bool{false, true} {
++		name := "CCSPickerCancelKeepsSelection"
++		if apply {
++			name = "CCSPickerApplyKeepsHistoryAndResume"
++		}
++		t.Run(name, func(t *testing.T) {
++			p := &ccsCUJPlatform{stubCardPlatform: &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
++			a := &ccsCUJAgent{cujAgent: &cujAgent{}, model: ccsPickerAgent{model: "model-a"}}
++			e := NewEngine("test", a, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
++			defer e.cancel()
++			control, _ := newCCSPickerHTTP(t)
++			e.SetProviderControl(control)
++			env := &cujEnv{t: t, engine: e, plat: &p.stubPlatformEngine, agent: a.cujAgent}
++			key := "test:ccs-cuj"
++			actionCount := 0
++			send := func(content string) {
++				actionCount++
++				e.ReceiveMessage(p, &Message{SessionKey: key, UserID: "ccs-cuj", UserName: "ccs-cuj", Platform: "test",
++					MessageID: fmt.Sprintf("ccs-action-%d", actionCount), Content: content, ReplyCtx: "ctx"})
++			}
++			tap := func(action string) {
++				t.Helper()
++				send(ccsCardCommand(t, lastCCSCard(t, p.stubCardPlatform), action))
++			}
++			send("remember the ccs picker conversation")
++			env.waitFor("first turn", 3*time.Second, func() bool {
++				return env.sentContains("model in use: model-a") && !env.activeSession(key).Busy()
++			})
++			p.clearSent()
++			send("/ccs")
++			if !env.sentContains("Desktop selection: Alpha") || !env.sentContains("Choose a provider") {
++				t.Fatal(p.getSent())
++			}
++			p.clearSent()
++			tap("provider:1")
++			if !env.sentContains("Choose a model for Beta") || !env.sentContains("Project model: model-a") {
++				t.Fatal(p.getSent())
++			}
++			p.clearSent()
++			tap("model:1")
++			if !env.sentContains("Apply this selection?") || !env.sentContains("model-b-plus") {
++				t.Fatal(p.getSent())
++			}
++			p.clearSent()
++			wantModel, wantProvider := "model-a", "Alpha"
++			if apply {
++				tap("apply")
++				wantModel, wantProvider = "model-b-plus", "Beta"
++				if !env.sentContains("Applied · Provider: Beta · Project model: model-b-plus") {
++					t.Fatal(p.getSent())
++				}
++			} else {
++				tap("cancel")
++				if !env.sentContains("Cancelled") {
++					t.Fatal(p.getSent())
++				}
++			}
++			p.clearSent()
++			send("/cc-switch current")
++			if !env.sentContains("Desktop selection: "+wantProvider) || !env.sentContains("Project model: "+wantModel) {
++				t.Fatal(p.getSent())
++			}
++			p.clearSent()
++			send("/history")
++			if !env.sentContains("remember the ccs picker conversation") {
++				t.Fatal("history disappeared: ", p.getSent())
++			}
++			p.clearSent()
++			send("continue after the picker")
++			env.waitFor("next turn uses the selected model", 3*time.Second, func() bool {
++				return env.sentContains("model in use: "+wantModel) && !env.activeSession(key).Busy()
++			})
++			if apply && a.lastResumeID() != "cuj-agent-session" {
++				t.Fatal("new model did not resume the existing native session")
++			}
++		})
++	}
++	t.Run("CCSPickerReloadsCompleteDesktopCatalog", func(test *testing.T) {
++		platform := &ccsCUJPlatform{stubCardPlatform: &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
++		agent := &ccsCUJAgent{cujAgent: &cujAgent{}, model: ccsPickerAgent{model: "model-a"}}
++		engine := NewEngine("test", agent, []Platform{platform}, filepath.Join(test.TempDir(), "sessions.json"), LangEnglish)
++		defer engine.cancel()
++		controller, fixture := newCCSPickerHTTP(test)
++		engine.SetProviderControl(controller)
++		modelSaves := 0
++		engine.modelSaveFunc = func(string) error { modelSaves++; return nil }
++		actionCount := 0
++		send := func(content string) {
++			actionCount++
++			engine.ReceiveMessage(platform, &Message{
++				SessionKey: "test:catalog-user", UserID: "catalog-user", Platform: "test",
++				MessageID: fmt.Sprintf("catalog-action-%d", actionCount), Content: content, ReplyCtx: "ctx",
++			})
++		}
++		tap := func(action string) {
++			test.Helper()
++			send(ccsCardCommand(test, lastCCSCard(test, platform.stubCardPlatform), action))
++		}
++		send("/ccs")
++		tap("provider:1")
++		if len(ccsCardSelect(test, lastCCSCard(test, platform.stubCardPlatform)).Options) != 2 {
++			test.Fatal("initial desktop catalog is missing models")
++		}
++		expectedModels := []string{"model-b"}
++		for index := range 121 {
++			expectedModels = append(expectedModels, fmt.Sprintf("vendor/catalog-model-%03d", index))
++		}
++		fixture.change(func(catalog *ProviderCatalog) {
++			catalog.Providers[1].Models = expectedModels
++		})
++		send("/ccs")
++		tap("provider:1")
++		seenModels := 0
++		for seenModels < len(expectedModels) {
++			options := ccsCardSelect(test, lastCCSCard(test, platform.stubCardPlatform)).Options
++			if len(options) != min(ccsPickerPageSize, len(expectedModels)-seenModels) {
++				test.Fatalf("incomplete model page after %d models: %d options", seenModels, len(options))
++			}
++			for _, option := range options {
++				if option.Text != expectedModels[seenModels] {
++					test.Fatalf("model %d = %q, want %q", seenModels, option.Text, expectedModels[seenModels])
++				}
++				seenModels++
++			}
++			if seenModels < len(expectedModels) {
++				tap("next")
++			}
++		}
++		tap(fmt.Sprintf("model:%d", len(expectedModels)-1))
++		preview := lastCCSCard(test, platform.stubCardPlatform).RenderText()
++		if !strings.Contains(preview, expectedModels[len(expectedModels)-1]) {
++			test.Fatal("last catalog model is missing from the confirmation preview: ", preview)
++		}
++		tap("cancel")
++		if fixture.posts.Load() != 0 || modelSaves != 0 || agent.GetModel() != "model-a" {
++			test.Fatal("browsing the refreshed catalog changed a provider or model")
++		}
++	})
++	t.Log("CUJ-F2: other model switching is covered by agent/*_test.go model tests")
+ }
+ 
+ // CUJ-F3 · /lang switches i18n locale; next reply uses new language.
+diff --git a/core/engine.go b/core/engine.go
+index e40f25c..9fb0711 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -360,6 +360,10 @@ type Engine struct {
+ 	attachmentSendEnabled bool
+ 	startedAt             time.Time
+ 
++	providerControl         ProviderController
++	ccsPickerMu             sync.Mutex
++	ccsPickers              map[string]*ccsPickerState
++	ccsApplyMu              sync.Mutex
+ 	providerSaveFunc        func(providerName string) error
+ 	providerAddSaveFunc     func(p ProviderConfig) error
+ 	providerRemoveSaveFunc  func(name string) error
+@@ -6295,6 +6299,7 @@ var builtinCommands = []struct {
+ 	{[]string{"lang"}, "lang"},
+ 	{[]string{"quiet"}, "quiet"},
+ 	{[]string{"provider"}, "provider"},
++	{[]string{"ccs", "cc-switch"}, "ccs"},
+ 	{[]string{"memory"}, "memory"},
+ 	{[]string{"cron"}, "cron"},
+ 	{[]string{"timer", "at", "remind"}, "timer"},
+@@ -6456,7 +6461,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
+ 		}
+ 	}
+ 
+-	if cmdID != "" && disabledCmds[cmdID] {
++	if cmdID != "" && (disabledCmds[cmdID] || (cmdID == "ccs" &&
++		(disabledCmds["provider"] || (len(args) > 0 && strings.EqualFold(args[0], "pick") && disabledCmds["model"])))) {
+ 		slog.Info("audit: command_blocked",
+ 			"user_id", msg.UserID, "platform", msg.Platform,
+ 			"project", e.name, "command", cmdID, "reason", "disabled")
+@@ -6509,6 +6515,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
+ 		e.cmdQuiet(p, msg, args)
+ 	case "provider":
+ 		e.cmdProvider(p, msg, args)
++	case "ccs":
++		e.cmdCCS(p, msg, args)
+ 	case "memory":
+ 		e.cmdMemory(p, msg, args)
+ 	case "cron":
+@@ -9416,7 +9424,7 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
+ 		seenCmds[primaryName] = true
+ 
+ 		// Skip disabled commands
+-		if disabledCmds[c.id] {
++		if disabledCmds[c.id] || (c.id == "ccs" && disabledCmds["provider"]) {
+ 			continue
+ 		}
+ 
+@@ -11691,7 +11699,7 @@ func (e *Engine) renderCardForPlatformWorkspace(p Platform, card *Card, workspac
+ 	if card == nil {
+ 		return nil
+ 	}
+-	out := &Card{}
++	out := &Card{UpdateOnAction: card.UpdateOnAction}
+ 	if card.Header != nil {
+ 		h := *card.Header
+ 		out.Header = &h
+diff --git a/core/i18n.go b/core/i18n.go
+index 6822451..38e672a 100644
+--- a/core/i18n.go
++++ b/core/i18n.go
+@@ -158,6 +158,43 @@ func (i *I18n) SetLang(lang Language) {
+ // Message keys
+ type MsgKey string
+ 
++const (
++	MsgCCSNotSelectable       MsgKey = "ccs_not_selectable"
++	MsgCCSDescription         MsgKey = "ccs"
++	MsgCCSUnconfirmed         MsgKey = "ccs_unconfirmed"
++	MsgCCSTitle               MsgKey = "ccs_title"
++	MsgCCSNotConfigured       MsgKey = "ccs_not_configured"
++	MsgCCSUnavailable         MsgKey = "ccs_unavailable"
++	MsgCCSUsage               MsgKey = "ccs_usage"
++	MsgCCSCurrent             MsgKey = "ccs_current"
++	MsgCCSSelected            MsgKey = "ccs_selected"
++	MsgCCSNotFound            MsgKey = "ccs_not_found"
++	MsgCCSSelect              MsgKey = "ccs_select"
++	MsgCCSRefresh             MsgKey = "ccs_refresh"
++	MsgCCSBlocked             MsgKey = "ccs_blocked"
++	MsgCCSShared              MsgKey = "ccs_shared"
++	MsgCCSNone                MsgKey = "ccs_none"
++	MsgCCSPickerTitle         MsgKey = "ccs_picker_title"
++	MsgCCSPickerExpired       MsgKey = "ccs_picker_expired"
++	MsgCCSKeepModel           MsgKey = "ccs_keep_model"
++	MsgCCSProjectModel        MsgKey = "ccs_project_model"
++	MsgCCSConfirmChoice       MsgKey = "ccs_confirm_choice"
++	MsgCCSApply               MsgKey = "ccs_apply"
++	MsgCCSPage                MsgKey = "ccs_page"
++	MsgCCSCancel              MsgKey = "ccs_cancel"
++	MsgCCSPickerScope         MsgKey = "ccs_picker_scope"
++	MsgCCSChooseProvider      MsgKey = "ccs_choose_provider"
++	MsgCCSProviderPlaceholder MsgKey = "ccs_provider_placeholder"
++	MsgCCSChooseModel         MsgKey = "ccs_choose_model"
++	MsgCCSNoModels            MsgKey = "ccs_no_models"
++	MsgCCSProviderOnly        MsgKey = "ccs_provider_only"
++	MsgCCSCancelled           MsgKey = "ccs_cancelled"
++	MsgCCSBusy                MsgKey = "ccs_busy"
++	MsgCCSPartial             MsgKey = "ccs_partial"
++	MsgCCSModelApplyFailed    MsgKey = "ccs_model_apply_failed"
++	MsgCCSPairSelected        MsgKey = "ccs_pair_selected"
++)
++
+ const (
+ 	MsgStarting                  MsgKey = "starting"
+ 	MsgThinking                  MsgKey = "thinking"
+@@ -378,31 +415,31 @@ const (
+ 	MsgCronIDLabel               MsgKey = "cron_id_label"
+ 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
+ 
+-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
+-	MsgTimerUsage         MsgKey = "timer_usage"
+-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
+-	MsgTimerAdded         MsgKey = "timer_added"
+-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
+-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
+-	MsgTimerEmpty         MsgKey = "timer_empty"
+-	MsgTimerListTitle     MsgKey = "timer_list_title"
+-	MsgTimerListFooter    MsgKey = "timer_list_footer"
+-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
+-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
+-	MsgTimerDeleted       MsgKey = "timer_deleted"
+-	MsgTimerNotFound      MsgKey = "timer_not_found"
+-	MsgTimerMuted         MsgKey = "timer_muted"
+-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
+-	MsgTimerCardHint      MsgKey = "timer_card_hint"
+-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
+-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
+-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
+-	MsgTimerIDLabel       MsgKey = "timer_id_label"
+-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
+-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
+-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
+-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
+-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
++	MsgTimerNotAvailable    MsgKey = "timer_not_available"
++	MsgTimerUsage           MsgKey = "timer_usage"
++	MsgTimerAddUsage        MsgKey = "timer_add_usage"
++	MsgTimerAdded           MsgKey = "timer_added"
++	MsgTimerAddedExec       MsgKey = "timer_added_exec"
++	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
++	MsgTimerEmpty           MsgKey = "timer_empty"
++	MsgTimerListTitle       MsgKey = "timer_list_title"
++	MsgTimerListFooter      MsgKey = "timer_list_footer"
++	MsgTimerDelUsage        MsgKey = "timer_del_usage"
++	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
++	MsgTimerDeleted         MsgKey = "timer_deleted"
++	MsgTimerNotFound        MsgKey = "timer_not_found"
++	MsgTimerMuted           MsgKey = "timer_muted"
++	MsgTimerUnmuted         MsgKey = "timer_unmuted"
++	MsgTimerCardHint        MsgKey = "timer_card_hint"
++	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
++	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
++	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
++	MsgTimerIDLabel         MsgKey = "timer_id_label"
++	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
++	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
++	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
++	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
++	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
+ 
+ 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
+ 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
+@@ -649,6 +686,244 @@ const (
+ )
+ 
+ var messages = map[MsgKey]map[Language]string{
++	MsgCCSNotSelectable: {
++		LangEnglish:            "This provider cannot be selected through the shared proxy. Choose another provider.",
++		LangChinese:            "此供应商不支持通过共享代理切换，请选择其他供应商。",
++		LangTraditionalChinese: "此供應商不支援透過共用代理切換，請選擇其他供應商。",
++		LangJapanese:           "このプロバイダーは共有プロキシで選択できません。別のプロバイダーを選んでください。",
++		LangSpanish:            "Este proveedor no se puede seleccionar mediante el proxy compartido. Elige otro proveedor.",
++	},
++	MsgCCSPickerTitle: {
++		LangEnglish:            "Provider & model · %s",
++		LangChinese:            "供应商与模型 · %s",
++		LangTraditionalChinese: "供應商與模型 · %s",
++		LangJapanese:           "プロバイダーとモデル · %s",
++		LangSpanish:            "Proveedor y modelo · %s",
++	},
++	MsgCCSPickerExpired: {
++		LangEnglish:            "This menu has expired or the selection has changed. Refresh to choose again.",
++		LangChinese:            "此菜单已失效或当前配置已变化，请刷新后重新选择。",
++		LangTraditionalChinese: "此選單已失效或目前設定已變更，請重新整理後再選擇。",
++		LangJapanese:           "メニューの有効期限が切れたか、設定が変更されました。更新して選び直してください。",
++		LangSpanish:            "El menú ha caducado o la configuración ha cambiado. Actualiza para volver a elegir.",
++	},
++	MsgCCSKeepModel: {
++		LangEnglish:            "Keep the current project model (agent default if unset)",
++		LangChinese:            "保持项目当前模型（未设置时使用默认值）",
++		LangTraditionalChinese: "保留專案目前模型（未設定時使用預設值）",
++		LangJapanese:           "現在のプロジェクトモデルを維持（未設定なら既定値）",
++		LangSpanish:            "Mantener el modelo del proyecto (predeterminado si no está configurado)",
++	},
++	MsgCCSProjectModel: {
++		LangEnglish:            "Project model: %s",
++		LangChinese:            "项目模型：%s",
++		LangTraditionalChinese: "專案模型：%s",
++		LangJapanese:           "プロジェクトモデル: %s",
++		LangSpanish:            "Modelo del proyecto: %s",
++	},
++	MsgCCSConfirmChoice: {
++		LangEnglish:            "Apply this selection?\nProvider: %s\nProject model: %s",
++		LangChinese:            "确认应用以下选择？\n供应商：%s\n项目模型：%s",
++		LangTraditionalChinese: "確認套用以下選擇？\n供應商：%s\n專案模型：%s",
++		LangJapanese:           "この選択を適用しますか？\nプロバイダー: %s\nプロジェクトモデル: %s",
++		LangSpanish:            "¿Aplicar esta selección?\nProveedor: %s\nModelo del proyecto: %s",
++	},
++	MsgCCSApply: {
++		LangEnglish:            "Confirm & apply",
++		LangChinese:            "确认生效",
++		LangTraditionalChinese: "確認套用",
++		LangJapanese:           "確認して適用",
++		LangSpanish:            "Confirmar y aplicar",
++	},
++	MsgCCSPage: {
++		LangEnglish:            "Page %d / %d",
++		LangChinese:            "第 %d / %d 页",
++		LangTraditionalChinese: "第 %d / %d 頁",
++		LangJapanese:           "%d / %d ページ",
++		LangSpanish:            "Página %d / %d",
++	},
++	MsgCCSCancel: {
++		LangEnglish:            "Cancel",
++		LangChinese:            "取消",
++		LangTraditionalChinese: "取消",
++		LangJapanese:           "キャンセル",
++		LangSpanish:            "Cancelar",
++	},
++	MsgCCSPickerScope: {
++		LangEnglish:            "Browsing does not switch anything; only confirmation applies changes. The provider affects the shared proxy. The model follows this project’s /model behavior; proxy model mappings still apply. Conversation history is kept.",
++		LangChinese:            "浏览不切换，确认后才生效。供应商影响共享代理；模型沿用项目 /model 行为，最终上游模型仍受代理映射影响。不清空对话历史。",
++		LangTraditionalChinese: "瀏覽不切換，確認後才生效。供應商影響共用代理；模型沿用專案 /model 行為，最終上游模型仍受代理映射影響。不會清除對話歷史。",
++		LangJapanese:           "閲覧だけでは変更されず、確認後に適用されます。プロバイダーは共有プロキシに、モデルはプロジェクトの /model と同じ範囲に適用されます。上流モデルにはプロキシのマッピングが引き続き適用されます。会話履歴は保持されます。",
++		LangSpanish:            "Navegar no cambia nada; solo la confirmación aplica los cambios. El proveedor afecta al proxy compartido. El modelo sigue el comportamiento de /model del proyecto; el proxy puede reasignar el modelo enviado. Se conserva el historial.",
++	},
++	MsgCCSChooseProvider: {
++		LangEnglish:            "1 · Choose a provider to view its configured models.",
++		LangChinese:            "1 · 选择供应商，查看其已配置的模型。",
++		LangTraditionalChinese: "1 · 選擇供應商，查看其已設定的模型。",
++		LangJapanese:           "1 · プロバイダーを選んで設定済みモデルを表示します。",
++		LangSpanish:            "1 · Elige un proveedor para ver sus modelos configurados.",
++	},
++	MsgCCSProviderPlaceholder: {
++		LangEnglish:            "Choose provider",
++		LangChinese:            "选择供应商",
++		LangTraditionalChinese: "選擇供應商",
++		LangJapanese:           "プロバイダーを選択",
++		LangSpanish:            "Elegir proveedor",
++	},
++	MsgCCSChooseModel: {
++		LangEnglish:            "2 · Choose a model for %s. Nothing changes until you confirm.",
++		LangChinese:            "2 · 为 %s 选择模型，确认前不会切换。",
++		LangTraditionalChinese: "2 · 為 %s 選擇模型，確認前不會切換。",
++		LangJapanese:           "2 · %s のモデルを選択します。確認するまで変更されません。",
++		LangSpanish:            "2 · Elige un modelo para %s. No se cambia nada hasta confirmar.",
++	},
++	MsgCCSNoModels: {
++		LangEnglish:            "CC Switch returned no configured models for this provider. You can switch only the provider and keep the project model.",
++		LangChinese:            "CC Switch 未返回此供应商的已配置模型。可以只切换供应商，保持项目模型不变。",
++		LangTraditionalChinese: "CC Switch 未回傳此供應商的已設定模型。可以只切換供應商，保留專案模型。",
++		LangJapanese:           "CC Switch からこのプロバイダーの設定済みモデルが返されませんでした。モデルを維持してプロバイダーのみ切り替えられます。",
++		LangSpanish:            "CC Switch no devolvió modelos configurados para este proveedor. Puedes cambiar solo el proveedor y mantener el modelo del proyecto.",
++	},
++	MsgCCSProviderOnly: {
++		LangEnglish:            "Keep model & continue",
++		LangChinese:            "保持模型，继续确认",
++		LangTraditionalChinese: "保留模型，繼續確認",
++		LangJapanese:           "モデルを維持して確認へ",
++		LangSpanish:            "Mantener modelo y continuar",
++	},
++	MsgCCSCancelled: {
++		LangEnglish:            "Cancelled. This menu made no provider or model changes.",
++		LangChinese:            "已取消，此菜单未修改供应商或模型。",
++		LangTraditionalChinese: "已取消，此選單未修改供應商或模型。",
++		LangJapanese:           "キャンセルしました。このメニューによるプロバイダーやモデルの変更はありません。",
++		LangSpanish:            "Cancelado. Este menú no cambió el proveedor ni el modelo.",
++	},
++	MsgCCSBusy: {
++		LangEnglish:            "A conversation or another selection is still in progress. Wait until it finishes, then refresh and try again.",
++		LangChinese:            "当前会话或另一项切换仍在进行。请结束后刷新重试，不会中断正在运行的任务。",
++		LangTraditionalChinese: "目前對話或另一項切換仍在進行。請結束後重新整理再試，不會中斷執行中的工作。",
++		LangJapanese:           "会話または別の切り替えが進行中です。完了後に更新して再試行してください。",
++		LangSpanish:            "Hay una conversación u otro cambio en curso. Espera a que termine, actualiza y vuelve a intentarlo.",
++	},
++	MsgCCSPartial: {
++		LangEnglish:            "The provider changed, but the project model could not be saved. Refresh to check both settings before retrying. No automatic rollback was attempted.",
++		LangChinese:            "供应商已切换，但项目模型保存失败。请刷新核对两项设置后重试；未自动回滚供应商。",
++		LangTraditionalChinese: "供應商已切換，但專案模型儲存失敗。請重新整理核對兩項設定後再試；未自動還原供應商。",
++		LangJapanese:           "プロバイダーは切り替わりましたが、プロジェクトモデルを保存できませんでした。更新して両方の設定を確認してください。自動ロールバックは行っていません。",
++		LangSpanish:            "El proveedor cambió, pero no se pudo guardar el modelo del proyecto. Actualiza y comprueba ambos ajustes antes de reintentar. No se intentó una reversión automática.",
++	},
++	MsgCCSModelApplyFailed: {
++		LangEnglish:            "The project model could not be saved. The provider was not changed. Refresh and try again.",
++		LangChinese:            "项目模型保存失败，供应商未改动。请刷新后重试。",
++		LangTraditionalChinese: "專案模型儲存失敗，供應商未變更。請重新整理後再試。",
++		LangJapanese:           "プロジェクトモデルを保存できませんでした。プロバイダーは変更されていません。更新して再試行してください。",
++		LangSpanish:            "No se pudo guardar el modelo del proyecto. No se cambió el proveedor. Actualiza y vuelve a intentarlo.",
++	},
++	MsgCCSPairSelected: {
++		LangEnglish:            "Applied · Provider: %s · Project model: %s",
++		LangChinese:            "已生效 · 供应商：%s · 项目模型：%s",
++		LangTraditionalChinese: "已套用 · 供應商：%s · 專案模型：%s",
++		LangJapanese:           "適用済み · プロバイダー: %s · プロジェクトモデル: %s",
++		LangSpanish:            "Aplicado · Proveedor: %s · Modelo del proyecto: %s",
++	},
++	MsgCCSDescription: {
++		LangEnglish:            "CC Switch provider and model menu",
++		LangChinese:            "CC Switch 供应商与模型菜单",
++		LangTraditionalChinese: "CC Switch 供應商與模型選單",
++		LangJapanese:           "CC Switch プロバイダーとモデルのメニュー",
++		LangSpanish:            "Menú de proveedores y modelos de CC Switch",
++	},
++	MsgCCSUnconfirmed: {
++		LangEnglish:            "The desktop did not confirm the selection. Refresh /ccs to check the current provider.",
++		LangChinese:            "桌面未确认本次切换，请刷新 /ccs 检查当前供应商。",
++		LangTraditionalChinese: "桌面未確認本次切換，請重新整理 /ccs 檢查目前供應商。",
++		LangJapanese:           "デスクトップで切り替えを確認できませんでした。/ccs を更新して現在のプロバイダーを確認してください。",
++		LangSpanish:            "El escritorio no confirmó el cambio. Actualiza /ccs para comprobar el proveedor actual.",
++	},
++	MsgCCSTitle: {
++		LangEnglish:            "CC Switch · %s",
++		LangChinese:            "CC Switch · %s",
++		LangTraditionalChinese: "CC Switch · %s",
++		LangJapanese:           "CC Switch · %s",
++		LangSpanish:            "CC Switch · %s",
++	},
++	MsgCCSNotConfigured: {
++		LangEnglish:            "CC Switch control is not configured for this project. Configure [projects.provider_control] to enable /ccs.",
++		LangChinese:            "此项目尚未配置 CC Switch 联动。请配置 [projects.provider_control] 后使用 /ccs。",
++		LangTraditionalChinese: "此專案尚未設定 CC Switch 聯動。請設定 [projects.provider_control] 後使用 /ccs。",
++		LangJapanese:           "このプロジェクトの CC Switch 連携は未設定です。[projects.provider_control] を設定してください。",
++		LangSpanish:            "CC Switch no está configurado para este proyecto. Configura [projects.provider_control] para habilitar /ccs.",
++	},
++	MsgCCSUnavailable: {
++		LangEnglish:            "CC Switch control is unavailable: %s. Check that the control-enabled desktop app is running and its control port is different from the model proxy port.",
++		LangChinese:            "CC Switch 控制接口不可用：%s。请确认已运行带控制接口的桌面程序，且控制端口与模型代理端口不同。",
++		LangTraditionalChinese: "CC Switch 控制介面無法使用：%s。請確認已執行含控制介面的桌面程式，且控制埠與模型代理埠不同。",
++		LangJapanese:           "CC Switch 制御 API を利用できません: %s。制御 API 対応のデスクトップアプリが起動中で、制御ポートとモデルプロキシのポートが異なることを確認してください。",
++		LangSpanish:            "El control de CC Switch no está disponible: %s. Comprueba que la aplicación con API de control está ejecutándose y que su puerto no coincide con el del proxy de modelos.",
++	},
++	MsgCCSUsage: {
++		LangEnglish:            "View: /ccs · Switch: /ccs switch <name or ID>",
++		LangChinese:            "查看：/ccs · 切换：/ccs switch <供应商名称或 ID>",
++		LangTraditionalChinese: "查看：/ccs · 切換：/ccs switch <供應商名稱或 ID>",
++		LangJapanese:           "表示: /ccs · 切り替え: /ccs switch <名前または ID>",
++		LangSpanish:            "Ver: /ccs · Cambiar: /ccs switch <nombre o ID>",
++	},
++	MsgCCSCurrent: {
++		LangEnglish:            "Desktop selection: %s",
++		LangChinese:            "桌面当前选择：%s",
++		LangTraditionalChinese: "桌面目前選擇：%s",
++		LangJapanese:           "デスクトップの選択: %s",
++		LangSpanish:            "Selección del escritorio: %s",
++	},
++	MsgCCSSelected: {
++		LangEnglish:            "Selected %s in the shared desktop proxy.",
++		LangChinese:            "已将桌面共享代理切换到 %s。",
++		LangTraditionalChinese: "已將桌面共用代理切換至 %s。",
++		LangJapanese:           "共有デスクトッププロキシを %s に切り替えました。",
++		LangSpanish:            "El proxy compartido del escritorio ahora usa %s.",
++	},
++	MsgCCSNotFound: {
++		LangEnglish:            "No unique selectable provider matches that name or ID. Refresh /ccs and use a provider ID if names are duplicated.",
++		LangChinese:            "找不到唯一且可切换的供应商。请刷新 /ccs；名称重复时使用供应商 ID。",
++		LangTraditionalChinese: "找不到唯一且可切換的供應商。請重新整理 /ccs；名稱重複時使用供應商 ID。",
++		LangJapanese:           "一意に選択できるプロバイダーが見つかりません。/ccs を更新し、名前が重複する場合は ID を指定してください。",
++		LangSpanish:            "No hay un proveedor único seleccionable con ese nombre o ID. Actualiza /ccs y usa el ID si hay nombres duplicados.",
++	},
++	MsgCCSSelect: {
++		LangEnglish:            "Select",
++		LangChinese:            "选择",
++		LangTraditionalChinese: "選擇",
++		LangJapanese:           "選択",
++		LangSpanish:            "Seleccionar",
++	},
++	MsgCCSRefresh: {
++		LangEnglish:            "Refresh",
++		LangChinese:            "刷新",
++		LangTraditionalChinese: "重新整理",
++		LangJapanese:           "更新",
++		LangSpanish:            "Actualizar",
++	},
++	MsgCCSBlocked: {
++		LangEnglish:            "Manual switching is disabled while the proxy is stopped or automatic failover is enabled.",
++		LangChinese:            "代理未运行或已开启自动故障转移，暂不允许手动切换。",
++		LangTraditionalChinese: "代理未執行或已啟用自動故障轉移，暫不允許手動切換。",
++		LangJapanese:           "プロキシが停止中、または自動フェイルオーバーが有効のため、手動切り替えは無効です。",
++		LangSpanish:            "El cambio manual está deshabilitado si el proxy está detenido o la conmutación automática está activada.",
++	},
++	MsgCCSShared: {
++		LangEnglish:            "Switching affects clients using this shared proxy; conversation history is kept. Models shown are provider defaults.",
++		LangChinese:            "切换影响使用此共享代理的客户端，不清空对话历史。所列模型为供应商配置模型。",
++		LangTraditionalChinese: "切換會影響使用此共用代理的用戶端，不會清除對話歷史。所列模型為供應商設定模型。",
++		LangJapanese:           "切り替えは共有プロキシを使用するクライアントに適用され、会話履歴は保持されます。表示モデルはプロバイダーの既定値です。",
++		LangSpanish:            "El cambio afecta a los clientes de este proxy compartido sin borrar el historial. Los modelos mostrados son los predeterminados del proveedor.",
++	},
++	MsgCCSNone: {
++		LangEnglish:            "None",
++		LangChinese:            "未选择",
++		LangTraditionalChinese: "未選擇",
++		LangJapanese:           "未選択",
++		LangSpanish:            "Ninguno",
++	},
+ 	MsgStarting: {
+ 		LangEnglish:            "⏳ Processing...",
+ 		LangChinese:            "⏳ 处理中...",
+diff --git a/core/provider_control.go b/core/provider_control.go
+new file mode 100644
+index 0000000..f1abe18
+--- /dev/null
++++ b/core/provider_control.go
+@@ -0,0 +1,273 @@
++package core
++
++import (
++	"bytes"
++	"context"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"time"
++)
++
++// ControlledProvider deliberately contains no credentials or upstream URLs.
++type ControlledProvider struct {
++	ID         string   `json:"id"`
++	Name       string   `json:"name"`
++	Model      string   `json:"model"`
++	Models     []string `json:"models"`
++	Selectable bool     `json:"selectable"`
++}
++
++type ProviderCatalog struct {
++	CurrentID    string               `json:"current_id"`
++	Providers    []ControlledProvider `json:"providers"`
++	ProxyRunning bool                 `json:"proxy_running"`
++	AutoFailover bool                 `json:"auto_failover"`
++}
++
++// ProviderController operates on the desktop's shared proxy, not agent sessions.
++type ProviderController interface {
++	Catalog(context.Context) (*ProviderCatalog, error)
++	Select(context.Context, string) (*ProviderCatalog, error)
++}
++
++type fileProviderControl struct {
++	configFile string
++	app        string
++	client     *http.Client
++}
++
++type providerControlCredentials struct {
++	Enabled     bool     `json:"enabled"`
++	Port        int      `json:"port"`
++	Token       string   `json:"token"`
++	AllowedApps []string `json:"allowed_apps"`
++}
++
++// NewProviderControl reads endpoint/credentials on every request, so rotating a
++// token or repairing a port does not require restarting the messaging bridge.
++// A numeric loopback address, no proxy, and no redirects keep its token local.
++func NewProviderControl(configFile, app string) (ProviderController, error) {
++	if strings.TrimSpace(configFile) == "" || app == "" {
++		return nil, errors.New("provider control requires a config file and application")
++	}
++	for _, r := range app {
++		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
++			return nil, errors.New("invalid provider control application")
++		}
++	}
++	return &fileProviderControl{
++		configFile: configFile,
++		app:        app,
++		client: &http.Client{
++			Timeout:       3 * time.Second,
++			Transport:     &http.Transport{Proxy: nil},
++			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
++		},
++	}, nil
++}
++
++func (c *fileProviderControl) Catalog(ctx context.Context) (*ProviderCatalog, error) {
++	return c.request(ctx, "", nil)
++}
++
++func (c *fileProviderControl) Select(ctx context.Context, id string) (*ProviderCatalog, error) {
++	if id == "" || len(id) > 256 {
++		return nil, errors.New("invalid provider ID")
++	}
++	return c.request(ctx, "/select", map[string]string{"id": id})
++}
++
++func (c *fileProviderControl) request(ctx context.Context, suffix string, payload any) (*ProviderCatalog, error) {
++	raw, err := os.ReadFile(c.configFile)
++	if err != nil {
++		return nil, errors.New("cannot read provider control configuration")
++	}
++	var cfg providerControlCredentials
++	if len(raw) > 65536 || json.Unmarshal(raw, &cfg) != nil {
++		return nil, errors.New("invalid provider control configuration")
++	}
++	if !cfg.Enabled {
++		return nil, errors.New("provider control API is disabled")
++	}
++	_, tokenErr := hex.DecodeString(cfg.Token)
++	if cfg.Port < 1 || cfg.Port > 65535 || len(cfg.Token) < 32 || len(cfg.Token) > 256 || tokenErr != nil {
++		return nil, errors.New("invalid provider control port or token")
++	}
++	allowed := false
++	for _, app := range cfg.AllowedApps {
++		allowed = allowed || app == c.app
++	}
++	if !allowed {
++		return nil, errors.New("application is not allowed by provider control configuration")
++	}
++	method := http.MethodGet
++	var body io.Reader
++	if payload != nil {
++		data, err := json.Marshal(payload)
++		if err != nil {
++			return nil, errors.New("invalid provider selection")
++		}
++		body = bytes.NewReader(data)
++		method = http.MethodPost
++	}
++	endpoint := fmt.Sprintf("http://127.0.0.1:%d/api/v1/providers/%s%s", cfg.Port, c.app, suffix)
++	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
++	if err != nil {
++		return nil, errors.New("cannot create provider control request")
++	}
++	req.Header.Set("Authorization", "Bearer "+cfg.Token)
++	if payload != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.client.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("cannot reach local provider control API: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		// Never reflect arbitrary response bodies: proxy errors can contain keys.
++		return nil, fmt.Errorf("provider control API returned HTTP %d", resp.StatusCode)
++	}
++	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
++	if err != nil || len(data) > 1<<20 {
++		return nil, errors.New("cannot read provider control response")
++	}
++	var catalog ProviderCatalog
++	if json.Unmarshal(data, &catalog) != nil || catalog.Providers == nil {
++		return nil, errors.New("invalid provider control response")
++	}
++	return &catalog, nil
++}
++
++// SetProviderControl is called during engine construction, before Start.
++func (e *Engine) SetProviderControl(control ProviderController) { e.providerControl = control }
++
++func (e *Engine) cmdCCS(p Platform, msg *Message, args []string) {
++	if e.providerControl == nil {
++		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSNotConfigured))
++		return
++	}
++	if len(args) > 0 && strings.EqualFold(args[0], "pick") {
++		e.cmdCCSPicker(p, msg, args[1:])
++		return
++	}
++	target := ""
++	if len(args) > 0 {
++		switch strings.ToLower(args[0]) {
++		case "list", "current":
++			if len(args) != 1 {
++				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSUsage))
++				return
++			}
++		case "switch":
++			target = strings.TrimSpace(strings.Join(args[1:], " "))
++			if target == "" {
++				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSUsage))
++				return
++			}
++		default:
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSUsage))
++			return
++		}
++	}
++	if target != "" {
++		// Serialize direct commands with confirmed card selections as well.
++		if !e.ccsApplyMu.TryLock() {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSBusy))
++			return
++		}
++		defer e.ccsApplyMu.Unlock()
++	}
++	ctx, cancel := context.WithTimeout(e.ctx, 6*time.Second)
++	defer cancel()
++	catalog, err := e.providerControl.Catalog(ctx)
++	if err != nil {
++		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgCCSUnavailable, err))
++		return
++	}
++	notice := ""
++	if target != "" {
++		if !catalog.ProxyRunning || catalog.AutoFailover {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSBlocked))
++			return
++		}
++		provider, ok := findControlledProvider(catalog, target)
++		if !ok || !provider.Selectable {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSNotFound))
++			return
++		}
++		catalog, err = e.providerControl.Select(ctx, provider.ID)
++		if err != nil {
++			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgCCSUnavailable, err))
++			return
++		}
++		if catalog.CurrentID != provider.ID {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCCSUnconfirmed))
++			return
++		}
++		notice = e.i18n.Tf(MsgCCSSelected, provider.Name)
++	}
++	e.replyCCSMenu(p, msg, catalog, notice)
++}
++
++func findControlledProvider(catalog *ProviderCatalog, target string) (ControlledProvider, bool) {
++	// Stable IDs take priority over display names; duplicate names fail closed.
++	for _, provider := range catalog.Providers {
++		if provider.ID == target {
++			return provider, true
++		}
++	}
++	var found ControlledProvider
++	matches := 0
++	for _, provider := range catalog.Providers {
++		if strings.EqualFold(provider.Name, target) {
++			found = provider
++			matches++
++		}
++	}
++	return found, matches == 1
++}
++
++func (e *Engine) renderProviderControlCard(catalog *ProviderCatalog, notice string) *Card {
++	current := catalog.CurrentID
++	if current == "" {
++		current = e.i18n.T(MsgCCSNone)
++	}
++	for _, provider := range catalog.Providers {
++		if provider.ID == catalog.CurrentID {
++			current = provider.Name
++			break
++		}
++	}
++	card := NewCard().Title(e.i18n.Tf(MsgCCSTitle, e.name), "blue").
++		Markdown(notice).Markdown(e.i18n.Tf(MsgCCSCurrent, current))
++	canSelect := catalog.ProxyRunning && !catalog.AutoFailover
++	if !canSelect {
++		card.Markdown(e.i18n.T(MsgCCSBlocked))
++	}
++	if len(catalog.Providers) == 0 {
++		card.Markdown(e.i18n.T(MsgProviderListEmpty))
++	}
++	for _, provider := range catalog.Providers {
++		text := provider.Name
++		if provider.Model != "" {
++			text += " · " + provider.Model
++		}
++		if provider.ID == catalog.CurrentID {
++			text = "▶ " + text
++		}
++		if canSelect && provider.Selectable && provider.ID != catalog.CurrentID {
++			card.ListItemBtn(text, e.i18n.T(MsgCCSSelect), "default", fmt.Sprintf("cmd:/ccs switch %q", provider.ID))
++		} else {
++			card.Markdown(text)
++		}
++	}
++	return card.Buttons(DefaultBtn(e.i18n.T(MsgCCSRefresh), "cmd:/ccs")).
++		Note(e.i18n.T(MsgCCSShared)).Note(e.i18n.T(MsgCCSUsage)).Build()
++}
+diff --git a/core/provider_control_test.go b/core/provider_control_test.go
+new file mode 100644
+index 0000000..05da457
+--- /dev/null
++++ b/core/provider_control_test.go
+@@ -0,0 +1,331 @@
++package core
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++)
++
++func TestCCSUnconfiguredCommandDoesNotReachAgent(t *testing.T) {
++	e := newTestEngine()
++	defer e.cancel()
++	p := &stubPlatformEngine{n: "test"}
++	msg := &Message{SessionKey: "test:user1", UserID: "user1", Platform: "test", ReplyCtx: "ctx"}
++	if !e.handleCommand(p, msg, "/ccs") {
++		t.Fatal("/ccs fell through to the AI agent instead of being handled as a command")
++	}
++	if len(p.getSent()) == 0 {
++		t.Fatal("/ccs must explain that provider control is not configured")
++	}
++}
++
++func writeControlConfig(t *testing.T, path, address, token string, apps []string) {
++	t.Helper()
++	u, err := url.Parse(address)
++	if err != nil {
++		t.Fatal(err)
++	}
++	port, err := strconv.Atoi(u.Port())
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, err := json.Marshal(providerControlCredentials{Enabled: true, Port: port, Token: token, AllowedApps: apps})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, data, 0600); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func controlForServer(t *testing.T, server *httptest.Server) (ProviderController, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "control-api.json")
++	writeControlConfig(t, path, server.URL, strings.Repeat("a", 64), []string{"test"})
++	control, err := NewProviderControl(path, "test")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(control.(*fileProviderControl).client.CloseIdleConnections)
++	return control, path
++}
++
++// A real HTTP boundary for command and CUJ tests; no desktop database is used.
++func newCCSFixture(t *testing.T) (ProviderController, *atomic.Int32) {
++	t.Helper()
++	var mu sync.Mutex
++	current := "a"
++	posts := &atomic.Int32{}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Authorization") != "Bearer "+strings.Repeat("a", 64) {
++			http.Error(w, "unauthorized", http.StatusUnauthorized)
++			return
++		}
++		mu.Lock()
++		defer mu.Unlock()
++		switch {
++		case r.URL.Path == "/api/v1/providers/test" && r.Method == http.MethodGet:
++		case r.URL.Path == "/api/v1/providers/test/select" && r.Method == http.MethodPost:
++			var request struct {
++				ID string `json:"id"`
++			}
++			if r.Header.Get("Content-Type") != "application/json" || json.NewDecoder(r.Body).Decode(&request) != nil {
++				http.Error(w, "invalid request", 400)
++				return
++			}
++			if request.ID != "a" && request.ID != "b" {
++				http.Error(w, "not found", 404)
++				return
++			}
++			current = request.ID
++			posts.Add(1)
++		default:
++			http.NotFound(w, r)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(ProviderCatalog{
++			CurrentID: current, ProxyRunning: true,
++			Providers: []ControlledProvider{
++				{ID: "a", Name: "Alpha", Model: "model-a", Selectable: true},
++				{ID: "b", Name: "Beta", Model: "model-b", Selectable: true},
++			},
++		})
++	}))
++	t.Cleanup(server.Close)
++	control, _ := controlForServer(t, server)
++	return control, posts
++}
++
++func TestCCSCatalogAndSwitchUseDesktopHTTP(t *testing.T) {
++	control, posts := newCCSFixture(t)
++	e := newTestEngine()
++	defer e.cancel()
++	e.SetProviderControl(control)
++	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
++	msg := &Message{SessionKey: "test:user1", UserID: "user1", Platform: "test", ReplyCtx: "ctx"}
++	for _, command := range []string{"/ccs", "/CCS list", "/cc-switch current"} {
++		if !e.handleCommand(p, msg, command) {
++			t.Fatalf("unhandled %s", command)
++		}
++	}
++	if posts.Load() != 0 {
++		t.Fatal("viewing a menu must never switch a provider")
++	}
++	if len(p.repliedCards) != 3 {
++		t.Fatalf("got %d cards", len(p.repliedCards))
++	}
++	card := p.repliedCards[0]
++	if !strings.Contains(card.RenderText(), "Desktop selection: Alpha") {
++		t.Fatal(card.RenderText())
++	}
++	callback := ""
++	for _, element := range card.Elements {
++		if item, ok := element.(CardListItem); ok {
++			callback = item.BtnValue
++		}
++	}
++	if callback != `cmd:/ccs switch "b"` {
++		t.Fatalf("unsafe or missing command callback: %q", callback)
++	}
++	if !e.handleCommand(p, msg, strings.TrimPrefix(callback, "cmd:")) {
++		t.Fatal("button command not handled")
++	}
++	if posts.Load() != 1 || !strings.Contains(p.repliedCards[3].RenderText(), "Desktop selection: Beta") {
++		t.Fatal("selection was not reflected in the returned menu")
++	}
++}
++
++func TestCCSInheritsDisabledProviderPolicy(t *testing.T) {
++	for _, disabled := range []string{"provider", "ccs", "cc-switch"} {
++		t.Run(disabled, func(t *testing.T) {
++			control, posts := newCCSFixture(t)
++			e := newTestEngine()
++			defer e.cancel()
++			e.SetProviderControl(control)
++			e.SetDisabledCommands([]string{disabled})
++			for _, command := range e.GetAllCommands() {
++				if command.Command == "ccs" {
++					t.Fatal("disabled command was advertised in the bot menu")
++				}
++			}
++			p := &stubPlatformEngine{n: "test"}
++			msg := &Message{SessionKey: "test:user1", UserID: "user1", ReplyCtx: "ctx"}
++			if !e.handleCommand(p, msg, "/ccs switch Beta") {
++				t.Fatal("command escaped policy gate")
++			}
++			if posts.Load() != 0 || !strings.Contains(strings.Join(p.getSent(), "\n"), "disabled") {
++				t.Fatal(p.getSent())
++			}
++		})
++	}
++}
++
++func TestCCSBlockedAndUnknownSelectionsDoNotWrite(t *testing.T) {
++	for _, scenario := range []string{"proxy-stopped", "auto-failover", "not-selectable", "missing", "ambiguous"} {
++		t.Run(scenario, func(t *testing.T) {
++			var writes atomic.Int32
++			catalog := ProviderCatalog{ProxyRunning: true, Providers: []ControlledProvider{{ID: "a", Name: "Alpha", Selectable: true}}}
++			target := "Alpha"
++			switch scenario {
++			case "proxy-stopped":
++				catalog.ProxyRunning = false
++			case "auto-failover":
++				catalog.AutoFailover = true
++			case "not-selectable":
++				catalog.Providers[0].Selectable = false
++			case "missing":
++				target = "missing"
++			case "ambiguous":
++				catalog.Providers = append(catalog.Providers, ControlledProvider{ID: "b", Name: "ALPHA", Selectable: true})
++			}
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.Method != http.MethodGet {
++					writes.Add(1)
++				}
++				_ = json.NewEncoder(w).Encode(catalog)
++			}))
++			defer server.Close()
++			control, _ := controlForServer(t, server)
++			e := newTestEngine()
++			defer e.cancel()
++			e.SetProviderControl(control)
++			p := &stubPlatformEngine{n: "test"}
++			e.handleCommand(p, &Message{SessionKey: "test:user1"}, "/ccs switch "+target)
++			if writes.Load() != 0 || len(p.getSent()) != 1 {
++				t.Fatal("rejected selection made a write or failed to explain why")
++			}
++		})
++	}
++}
++
++func TestProviderControlRejectsErrorsWithoutLeakingBodies(t *testing.T) {
++	for _, status := range []int{301, 401, 403, 404, 409, 500} {
++		t.Run(strconv.Itoa(status), func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(status)
++				_, _ = fmt.Fprint(w, "SECRET-RESPONSE-BODY")
++			}))
++			defer server.Close()
++			control, _ := controlForServer(t, server)
++			_, err := control.Catalog(context.Background())
++			if err == nil || !strings.Contains(err.Error(), strconv.Itoa(status)) || strings.Contains(err.Error(), "SECRET") {
++				t.Fatalf("unsafe error: %v", err)
++			}
++		})
++	}
++}
++
++func TestProviderControlNeverFollowsRedirects(t *testing.T) {
++	var leaked atomic.Int32
++	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked.Add(1) }))
++	defer destination.Close()
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
++	}))
++	defer server.Close()
++	control, _ := controlForServer(t, server)
++	if _, err := control.Catalog(context.Background()); err == nil {
++		t.Fatal("redirect accepted")
++	}
++	if leaked.Load() != 0 {
++		t.Fatal("authorization could have escaped to a redirect target")
++	}
++}
++
++func TestProviderControlReloadsCredentialsAndFailsClosed(t *testing.T) {
++	var expected atomic.Value
++	expected.Store(strings.Repeat("a", 64))
++	var calls atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls.Add(1)
++		if r.Header.Get("Authorization") != "Bearer "+expected.Load().(string) {
++			http.Error(w, "unauthorized", 401)
++			return
++		}
++		_, _ = fmt.Fprint(w, `{"current_id":"desktop-selected","providers":[],"proxy_running":true,"api_key":"SECRET"}`)
++	}))
++	defer server.Close()
++	control, path := controlForServer(t, server)
++	for _, token := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
++		expected.Store(token)
++		writeControlConfig(t, path, server.URL, token, []string{"test"})
++		catalog, err := control.Catalog(context.Background())
++		if err != nil {
++			t.Fatal(err)
++		}
++		data, _ := json.Marshal(catalog)
++		if strings.Contains(string(data), "SECRET") || catalog.CurrentID != "desktop-selected" {
++			t.Fatal("unsafe catalog")
++		}
++	}
++	writeControlConfig(t, path, server.URL, strings.Repeat("b", 64), []string{"other"})
++	if _, err := control.Catalog(context.Background()); err == nil {
++		t.Fatal("application allowlist ignored")
++	}
++	writeControlConfig(t, path, server.URL, "bad-token", []string{"test"})
++	if _, err := control.Catalog(context.Background()); err == nil {
++		t.Fatal("invalid token accepted")
++	}
++	if calls.Load() != 2 {
++		t.Fatal("invalid configurations made network requests")
++	}
++	if _, err := NewProviderControl(path, "../test"); err == nil {
++		t.Fatal("path injection accepted")
++	}
++}
++
++func TestProviderControlRejectsOversizeInvalidAndCancelledResponses(t *testing.T) {
++	for _, body := range []string{"not JSON", "null", "{}", `{"providers":null}`, `{"providers":{}}`, strings.Repeat("x", (1<<20)+1)} {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprint(w, body) }))
++		control, _ := controlForServer(t, server)
++		if _, err := control.Catalog(context.Background()); err == nil {
++			t.Fatal("invalid response accepted")
++		}
++		server.Close()
++	}
++	control, _ := newCCSFixture(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := control.Catalog(ctx); err == nil {
++		t.Fatal("request ignored context cancellation")
++	}
++}
++
++func TestCCSSelectionMustBeConfirmedByDesktop(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = json.NewEncoder(w).Encode(ProviderCatalog{
++			CurrentID: "a", ProxyRunning: true,
++			Providers: []ControlledProvider{{ID: "b", Name: "Beta", Selectable: true}},
++		})
++	}))
++	defer server.Close()
++	control, _ := controlForServer(t, server)
++	e := newTestEngine()
++	defer e.cancel()
++	e.SetProviderControl(control)
++	p := &stubPlatformEngine{n: "test"}
++	e.handleCommand(p, &Message{SessionKey: "test:user1"}, "/ccs switch Beta")
++	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "did not confirm") || strings.Contains(got, "Selected Beta") {
++		t.Fatalf("unconfirmed selection was reported as successful: %s", got)
++	}
++}
++
++func TestCCSStableIDWinsOverDisplayName(t *testing.T) {
++	catalog := &ProviderCatalog{Providers: []ControlledProvider{
++		{ID: "other", Name: "b"}, {ID: "b", Name: "Beta"},
++	}}
++	provider, found := findControlledProvider(catalog, "b")
++	if !found || provider.ID != "b" {
++		t.Fatal("display name shadowed a stable provider ID")
++	}
++}
+diff --git a/docs/ccs-model-picker.md b/docs/ccs-model-picker.md
+new file mode 100644
+index 0000000..aefde55
+--- /dev/null
++++ b/docs/ccs-model-picker.md
+@@ -0,0 +1,114 @@
++# `/ccs` 供应商与模型卡片
++
++> **上线前提：完整 Codex 模型列表需要 CC Switch 控制接口包含模型目录修复。** 仅更新 cc-connect 或刷新卡片，不能补齐旧接口遗漏的模型。卡片部署记录见 [飞书卡片更新](../../ccs-picker-feishu-deploy/README.md)，本次模型目录修复状态见 [修复说明](../../ccs-model-catalog-fix/README.md)。不得为此重跑既有 Stage / Activate / Rollback / Queue 脚本，也不要覆盖 `ccs-repair` 基线。
++>
++> **验证状态：卡片专项、全部 CUJ 与构建已通过，但 Windows 全量测试和全量 `go vet` 未通过。** 这是待上线测试版，不代表仓库所有测试已通过。
++>
++> **切换范围：供应商属于 CC Switch 的共享代理；模型沿用当前项目或绑定 workspace 的 `/model` 设置。** 同一代理的其他使用者也可能受供应商切换影响。确认前请查看卡片中的当前值与目标值。
++
++提供类似 Hermes 模型选择器的原生下拉交互：**选择供应商 → 选择模型 → 确认应用**。入口为 `/ccs`，本次不替换原来的 `/model` 命令。
++
++## 开始选择
++
++在机器人会话中发送：
++
++```text
++/ccs
++```
++
++1. 在供应商下拉中选择目标。也可以选择当前供应商，只更换项目模型。
++2. 在下一屏选择该供应商的模型。
++3. 核对供应商、模型和共享范围，点击“确认应用”。
++4. 结果卡片显示应用结果，并允许继续选择。
++
++飞书优先更新点击的原卡片，而不是持续发送新卡片。原位更新失败时会补发结果卡片，**只重试消息投递，不重复执行切换**。
++
++以下操作不切换供应商或模型：打开菜单、选择下拉项、翻页、返回、刷新、取消。只有最后的确认按钮会应用选择。旧的显式 `/ccs switch ...` 命令仍保留原有直接切换行为，不经过这个确认流程。
++
++可用入口：
++
++| 命令 | 用途 |
++| --- | --- |
++| `/ccs` | 打开选择器 |
++| `/cc-switch` | 同一入口的别名 |
++| `/ccs current` | 读取当前状态并显示菜单 |
++| `/ccs list` | 读取供应商目录并显示菜单 |
++| `/model` | 保留原有项目模型菜单，不改成 CC Switch 入口 |
++
++## 模型列表的来源与刷新
++
++下拉数据来自 **CC Switch 控制接口公开的已配置模型**，不是在线查询供应商的完整模型列表，也不会补入猜测的模型名称。
++
++- Claude 目录可包含默认模型及已配置的模型档位。
++- Codex 目录包含默认模型，以及该供应商在 CC Switch 中保存的全部 `modelCatalog.models[].model`。默认模型排在前面，其余按保存顺序展示；去除首尾空白和重复 ID，不按显示名称合并不同模型。
++- 每页最多 50 个模型，更多模型通过“下一页”查看，不会只保留前 50 个。新增模型并在 CC Switch 保存后，重新发送 `/ccs` 或刷新菜单即可读取新目录。
++- 若供应商未提供任何模型，显示“保持模型，只切换供应商”的确认流程。
++- 选择的是项目 `/model` 所用的模型；**最终上游模型仍可能被 CC Switch 的代理映射改写**。
++- 本实现不调用 CC Switch 尚未作为当前通用控制契约开放的模型修改接口，也不修改供应商的默认模型配置。
++
++若保存了多个模型却仍只能看到默认模型，应先确认**运行中的 CC Switch** 已安装本次控制接口修复；只重新构建或重启 cc-connect 无法修复旧接口。模型目录只返回模型 ID，不公开认证信息、完整供应商设置或模型元数据。
++
++## 显示卡片的条件
++
++| 条件 | 行为 |
++| --- | --- |
++| 当前项目已配置 `ProviderController` | 沿用已有 CC Switch 控制接口集成，无需新增端口 |
++| 平台支持 `CardSender`，agent 支持 `ModelSwitcher` | 展示供应商与模型选择器 |
++| 飞书 `enable_feishu_card` 未设为 `false` | 默认启用交互卡片 |
++| `ccs`、`provider` 和 `model` 命令权限允许 | 回调通过正常命令入口检查权限，不绕过角色限制 |
++| 无卡片能力、无模型切换能力，或禁止 `/model` | 退回原供应商菜单或纯文本，不提供模型选择 |
++
++本次不改写任何生产配置。若运行实例主动关闭了飞书卡片，需要在后续受控更新中单独检查该设置。
++
++## 遇到错误时
++
++| 提示或现象 | 原因与处理 |
++| --- | --- |
++| 卡片已失效 | 每屏凭据有效期 10 分钟且单次使用；重新发 `/ccs`。目录、当前供应商、项目模型或 workspace 改变时也会拒绝旧确认。 |
++| 旧卡片不能继续点击 | 同一用户在同一会话新开菜单会替换自己的旧选择状态；使用最新卡片。 |
++| 会话或选择操作忙碌 | 等当前会话本轮任务或当前切换结束后，重新打开菜单；不会为切换而中断任务。 |
++| 代理停止、自动故障转移开启或供应商不可选 | 可以查看目录，但不能应用该选择；先在正常管理流程中处理原因。 |
++| 供应商未确认 | 控制接口未明确确认目标供应商，项目模型不会继续修改；先用 `/ccs current` 核对实际状态，不要假定切换一定失败。 |
++| 供应商已切换但项目模型应用失败 | 会明确报告部分成功，不盲目回滚共享供应商；核对当前值后再处理模型保存问题。 |
++| 点击别人的卡片或重复确认 | 凭据绑定用户与会话，重复、跨用户、跨会话回调不能再次应用选择。 |
++
++状态仅保存在内存中，最多保留 128 屏待处理选择；服务重启后旧卡片失效。每页最多 50 项。回调携带随机凭据与选项索引，不把供应商名称、模型名称或配置凭据放进命令参数。
++
++供应商切换与模型保存不是跨进程原子事务。当前 Engine 会串行处理自己的 `/ccs` 写操作，并在确认前重新校验目录、模型和 workspace；其他项目、桌面操作或外部进程仍可能改变共享代理。不会尝试通过自动回滚覆盖其他使用者的选择。
++
++## 实现与验证依据
++
++| Evidence | Finding | Path |
++| --- | --- | --- |
++| [`core/ccs_picker.go`](../core/ccs_picker.go)、[`core/ccs_picker_test.go`](../core/ccs_picker_test.go) | 浏览不写入；确认有单次凭据、权限、过期、可选性、忙碌及状态校验 | `ReceiveMessage` → `/ccs pick` → 校验 → 确认供应商 → 应用项目模型 |
++| [`platform/feishu/card.go`](../platform/feishu/card.go)、[`card_command_test.go`](../platform/feishu/card_command_test.go) | 原位更新针对源消息；投递失败不重新执行命令 | `cmd:` 回调 → 正常消息入口 → `ReplyCard` → PATCH 源卡片或补发结果 |
++| [`core/cuj_test.go`](../core/cuj_test.go) 的 F2 子用例 | 验证聊天、选择、确认或取消、历史、下一轮模型与原生 resume 的连续行为 | 聊天 → 菜单 → 选择 → 确认/取消 → current/history → 下一轮聊天 |
++
++专项验证命令，在仓库根目录运行：
++
++```powershell
++go test ./core ./platform/feishu ./config -run 'TestCCS|TestProviderControl|TestRenderCardMap_InPlace|TestCardAction_InPlace|TestReplyCard_InPlace' -count=1
++go test ./core -run TestCUJ -count=1
++go build ./...
++git diff --check
++```
++
++全部测试和静态检查仍应分别运行 `go test ./...`、`go vet ./...`，不能以专项测试替代全量通过。Windows 环境中的未通过项目与独立构建信息记录在本次交付说明中；缺少 C 编译器时不宣称 race detector 已通过。
++
++### 本次验证结果（2026-09-14）
++
++| 检查 | 结果 |
++| --- | --- |
++| 卡片、ProviderControl、配置专项测试 | 通过（core / feishu / config） |
++| `go test ./core -run TestCUJ -count=1` | 通过，包括 F2 卡片子流程 |
++| 飞书完整包测试 | 在全量运行中通过 |
++| CLI ProviderControl 文件级测试 | 通过；避开不相关的 Windows 测试编译问题单独验证 |
++| `go vet ./core ./platform/feishu ./config` | 通过 |
++| `go build ./...` | 通过 |
++| 独立 Windows/amd64 构建 | 通过，版本 `v1.5.0-ccs-picker.1`，未安装 |
++| `git diff --check`、变更 Go 文件 gofmt 检查 | 通过；未为 CRLF 差异改写旧文件 |
++| `go test ./...` | 未通过，共 12 个包失败；本次新增功能测试未出现失败 |
++| `go vet ./...` | 未通过，`doctor_runas_test.go` 在 Windows 引用了仅 Unix 定义的符号 |
++| race detector | 未运行：当前 `CGO_ENABLED=0`，未发现可用 C 编译器；未安装额外工具链 |
++
++全量失败包括现有 `.sh` 测试夹具无法作为 Win32 程序执行、Unix 文件权限假设、HOME/路径差异，以及若干时序测试失败。全量运行中的一个 CUJ 时序失败在随后单独运行全部 CUJ 时通过。未批量改写这些无关测试，也不把局部通过表述为全量通过。
+diff --git a/platform/feishu/card.go b/platform/feishu/card.go
+index 7570239..4929d31 100644
+--- a/platform/feishu/card.go
++++ b/platform/feishu/card.go
+@@ -6,10 +6,12 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/chenhg5/cc-connect/core"
+ 	lark "github.com/larksuite/oapi-sdk-go/v3"
+ 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
++	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+ 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+ )
+ 
+@@ -17,6 +19,43 @@ func plainText(content string) map[string]any {
+ 	return map[string]any{"tag": "plain_text", "content": content}
+ }
+ 
++// commandCardReply hands the engine's authorized response back to the exact
++// Feishu callback that requested it. An unbuffered channel makes timeout vs.
++// delivery exclusive: a late response must fall back to PATCH, never disappear
++// into an unread buffered channel. done also releases any subsequent replies.
++type commandCardReply struct {
++	cards chan *core.Card
++	done  chan struct{}
++}
++
++func (r *commandCardReply) deliver(ctx context.Context, card *core.Card) bool {
++	select {
++	case r.cards <- card:
++		return true
++	case <-r.done:
++		return false
++	case <-ctx.Done():
++		return false
++	}
++}
++
++func (r *commandCardReply) response(sessionKey string) *callback.CardActionTriggerResponse {
++	timer := time.NewTimer(cardNavTimeout)
++	defer timer.Stop()
++	select {
++	case card := <-r.cards:
++		return &callback.CardActionTriggerResponse{
++			Card: &callback.Card{Type: "raw", Data: renderCardMap(card, sessionKey)},
++		}
++	case <-timer.C:
++		// The callback deadline is shorter than some provider/lookup requests.
++		// Closing done in the caller lets the eventual ReplyCard PATCH once.
++		return &callback.CardActionTriggerResponse{
++			Toast: &callback.Toast{Type: "info", Content: "⏳ Loading... / 加载中..."},
++		}
++	}
++}
++
+ // ReplyCard sends a structured card as a reply to the original message.
+ func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *core.Card) error {
+ 	rc, ok := rctx.(replyContext)
+@@ -24,7 +63,18 @@ func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *cor
+ 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+ 	}
+ 
++	if rc.commandCard != nil && rc.commandCard.deliver(ctx, card) {
++		return nil
++	}
+ 	cardJSON := renderCard(card, rc.sessionKey)
++	if rc.updateCard && rc.messageID != "" {
++		if err := p.patchCommandCard(ctx, rc.messageID, cardJSON); err == nil {
++			return nil
++		} else {
++			// Never repeat the command if delivery fails; only fall back to a reply.
++			slog.Warn(p.tag()+": in-place command card failed; sending reply", "error", err)
++		}
++	}
+ 	if !p.shouldUseThreadOrReplyAPI(rc) {
+ 		if rc.chatID == "" {
+ 			return fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
+@@ -34,6 +84,25 @@ func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *cor
+ 	return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+ }
+ 
++// patchCommandCard targets the exact callback message, not the most recent
++// message for a session (two open menus must never overwrite each other).
++func (p *interactivePlatform) patchCommandCard(ctx context.Context, messageID, content string) error {
++	req := larkim.NewPatchMessageReqBuilder().MessageId(messageID).
++		Body(larkim.NewPatchMessageReqBodyBuilder().Content(content).Build()).Build()
++	return p.withTransientRetry(ctx, "update command card", func() error {
++		return p.withFreshTenantAccessTokenRetry(ctx, "update command card", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
++			resp, err := client.Im.Message.Patch(ctx, req, options...)
++			if err != nil {
++				return fmt.Errorf("%s: update command card: %w", p.tag(), err)
++			}
++			if !resp.Success() {
++				return fmt.Errorf("%s: update command card code=%d", p.tag(), resp.Code)
++			}
++			return nil
++		})
++	})
++}
++
+ // SendCard sends a structured card as a new message to the chat.
+ func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core.Card) error {
+ 	rc, ok := rctx.(replyContext)
+@@ -255,10 +324,44 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
+ 		elements = []map[string]any{{"tag": "markdown", "content": " "}}
+ 	}
+ 
++	if card.UpdateOnAction {
++		// Keep delayed updates shared instead of leaving the clicker's local
++		// interactive copy on an old screen. Other cards keep their old mode.
++		result["config"].(map[string]any)["update_multi"] = true
++		markInPlaceCommandActions(elements)
++	}
+ 	result["elements"] = elements
+ 	return result
+ }
+ 
++// Mark only cmd: controls. nav:/act: retain their existing callback protocol.
++func markInPlaceCommandActions(elements []map[string]any) {
++	for _, elem := range elements {
++		value, _ := elem["value"].(map[string]string)
++		isCommand := strings.HasPrefix(value["action"], "cmd:")
++		if options, ok := elem["options"].([]map[string]any); ok && len(options) > 0 {
++			isCommand = true
++			for _, option := range options {
++				v, _ := option["value"].(string)
++				isCommand = isCommand && strings.HasPrefix(v, "cmd:")
++			}
++		}
++		if isCommand {
++			// Dropdowns may have no value map when no session key was supplied.
++			if value == nil {
++				value = make(map[string]string)
++				elem["value"] = value
++			}
++			value["update_card"] = "true"
++		}
++		for _, key := range []string{"actions", "columns", "elements"} {
++			if children, ok := elem[key].([]map[string]any); ok {
++				markInPlaceCommandActions(children)
++			}
++		}
++	}
++}
++
+ type deleteModeCheckerRow struct {
+ 	id      string
+ 	text    string
+diff --git a/platform/feishu/card_command_inline_test.go b/platform/feishu/card_command_inline_test.go
+new file mode 100644
+index 0000000..f4820b1
+--- /dev/null
++++ b/platform/feishu/card_command_inline_test.go
+@@ -0,0 +1,313 @@
++package feishu
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/chenhg5/cc-connect/core"
++	lark "github.com/larksuite/oapi-sdk-go/v3"
++	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
++)
++
++// Only external boundaries are fake: the Feishu HTTP API, provider controller,
++// and agent process. The engine, session manager, renderer, JSON callback, and
++// normal command authorization/dispatch are real. No production configuration
++// or credentials are loaded and no agent process is started.
++type inlinePickerAgent struct {
++	mu             sync.Mutex
++	model          string
++	starts, writes atomic.Int32
++}
++
++func (a *inlinePickerAgent) Name() string { return "fixture" }
++func (a *inlinePickerAgent) StartSession(context.Context, string) (core.AgentSession, error) {
++	a.starts.Add(1)
++	return nil, errors.New("agent execution is not allowed in this fixture")
++}
++func (a *inlinePickerAgent) ListSessions(context.Context) ([]core.AgentSessionInfo, error) {
++	return nil, nil
++}
++func (a *inlinePickerAgent) Stop() error { return nil }
++func (a *inlinePickerAgent) SetModel(model string) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	a.writes.Add(1)
++	a.model = model
++}
++func (a *inlinePickerAgent) GetModel() string                                   { a.mu.Lock(); defer a.mu.Unlock(); return a.model }
++func (a *inlinePickerAgent) AvailableModels(context.Context) []core.ModelOption { return nil }
++
++type inlinePickerControl struct{ writes atomic.Int32 }
++
++func (c *inlinePickerControl) Catalog(context.Context) (*core.ProviderCatalog, error) {
++	return &core.ProviderCatalog{CurrentID: "a", ProxyRunning: true, Providers: []core.ControlledProvider{
++		{ID: "a", Name: "Alpha", Model: "model-a", Models: []string{"model-a", "model-a-plus"}, Selectable: true},
++		{ID: "b", Name: "Beta", Model: "model-b", Models: []string{"model-b", "model-b-plus"}, Selectable: true},
++	}}, nil
++}
++func (c *inlinePickerControl) Select(context.Context, string) (*core.ProviderCatalog, error) {
++	c.writes.Add(1)
++	return nil, errors.New("provider selection is not allowed in this fixture")
++}
++
++type inlinePickerHTTP struct {
++	method, path string
++	card         map[string]any
++}
++type inlinePickerHarness struct {
++	p        *interactivePlatform
++	e        *core.Engine
++	agent    *inlinePickerAgent
++	control  *inlinePickerControl
++	requests chan inlinePickerHTTP
++	handled  chan struct{}
++}
++
++const inlinePickerKey = "feishu:oc_fixture_picker:ou_fixture_picker"
++
++func newInlinePickerHarness(t *testing.T) *inlinePickerHarness {
++	t.Helper()
++	h := &inlinePickerHarness{requests: make(chan inlinePickerHTTP, 32), handled: make(chan struct{}, 32),
++		agent: &inlinePickerAgent{model: "model-a"}, control: &inlinePickerControl{}}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal" {
++			writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": "fixture-only-token"})
++			return
++		}
++		if (r.Method == http.MethodPost && r.URL.Path == "/open-apis/im/v1/messages/om_command/reply") ||
++			(r.Method == http.MethodPatch && r.URL.Path == "/open-apis/im/v1/messages/om_picker") {
++			var body struct {
++				Content string `json:"content"`
++			}
++			var card map[string]any
++			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++				t.Error(err)
++			}
++			if err := json.Unmarshal([]byte(body.Content), &card); err != nil {
++				t.Error(err)
++			}
++			h.requests <- inlinePickerHTTP{r.Method, r.URL.Path, card}
++			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": "om_picker"}})
++			return
++		}
++		t.Errorf("unexpected fixture API request: %s %s", r.Method, r.URL.Path)
++		http.Error(w, "unexpected fixture request", 400)
++	}))
++	t.Cleanup(server.Close)
++	platform, err := New(map[string]any{"app_id": "cli_inline_picker", "app_secret": "fixture-only", "enable_feishu_card": true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.p = platform.(*interactivePlatform)
++	h.p.domain = server.URL
++	h.p.client = lark.NewClient(h.p.appID, h.p.appSecret, lark.WithOpenBaseUrl(server.URL), lark.WithHttpClient(server.Client()), lark.WithEnableTokenCache(false))
++	h.p.replayClient = lark.NewClient(h.p.appID, h.p.appSecret, lark.WithOpenBaseUrl(server.URL), lark.WithHttpClient(server.Client()), lark.WithEnableTokenCache(false))
++	h.p.userNameCache.Store("ou_fixture_picker", "Fixture user")
++	h.p.chatNameCache.Store("oc_fixture_picker", "Fixture chat")
++	// A different card in this session must never be used for a delayed update.
++	h.p.cardActionMsgIDs = map[string]string{inlinePickerKey: "om_unrelated"}
++	h.e = core.NewEngine("picker-fixture", h.agent, []core.Platform{h.p}, filepath.Join(t.TempDir(), "sessions.json"), core.LangEnglish)
++	h.e.SetProviderControl(h.control)
++	h.e.SetModelSaveFunc(func(string) error { t.Error("preview persisted a model"); return nil })
++	t.Cleanup(func() { _ = h.e.Stop() })
++	h.p.handler = func(p core.Platform, msg *core.Message) {
++		if msg.UserID != "ou_fixture_picker" || msg.SessionKey != inlinePickerKey {
++			t.Error("callback lost its actor/session binding")
++		}
++		h.e.ReceiveMessage(p, msg)
++		h.handled <- struct{}{}
++	}
++	return h
++}
++func (h *inlinePickerHarness) initial(t *testing.T) map[string]any {
++	t.Helper()
++	h.e.ReceiveMessage(h.p, &core.Message{Content: "/ccs", Platform: "feishu", UserID: "ou_fixture_picker", SessionKey: inlinePickerKey,
++		ReplyCtx: replyContext{messageID: "om_command", chatID: "oc_fixture_picker", sessionKey: inlinePickerKey}})
++	select {
++	case r := <-h.requests:
++		return r.card
++	case <-time.After(3 * time.Second):
++		t.Fatal("initial card not delivered")
++		return nil
++	}
++}
++
++// Build the same JSON shape that Feishu sends, from the exact rendered control
++// metadata; do not invent update_card/session_key fields as the old tests did.
++func inlinePickerEvent(t *testing.T, card map[string]any, choice string) *callback.CardActionTriggerEvent {
++	t.Helper()
++	var action map[string]any
++	var walk func(any)
++	matches := func(value string) bool { return value == choice || strings.HasSuffix(value, " "+choice) }
++	walk = func(node any) {
++		if action != nil {
++			return
++		}
++		switch v := node.(type) {
++		case []any:
++			for _, child := range v {
++				walk(child)
++			}
++		case map[string]any:
++			if v["tag"] == "select_static" {
++				options, _ := v["options"].([]any)
++				for _, o := range options {
++					option, _ := o.(map[string]any)
++					value, _ := option["value"].(string)
++					if matches(value) {
++						action = map[string]any{"tag": "select_static", "option": value, "value": v["value"]}
++						return
++					}
++				}
++			}
++			if v["tag"] == "button" {
++				value, _ := v["value"].(map[string]any)
++				command, _ := value["action"].(string)
++				if matches(command) {
++					action = map[string]any{"tag": "button", "value": value}
++					return
++				}
++			}
++			for _, child := range v {
++				walk(child)
++			}
++		}
++	}
++	walk(card)
++	if action == nil {
++		t.Fatalf("rendered card has no %s control", choice)
++	}
++	raw, err := json.Marshal(map[string]any{"event": map[string]any{
++		"operator": map[string]any{"open_id": "ou_fixture_picker"}, "action": action,
++		"context": map[string]any{"open_chat_id": "oc_fixture_picker", "open_message_id": "om_picker"},
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var event callback.CardActionTriggerEvent
++	if err = json.Unmarshal(raw, &event); err != nil {
++		t.Fatal(err)
++	}
++	return &event
++}
++func inlinePickerResponseMap(t *testing.T, response *callback.CardActionTriggerResponse) map[string]any {
++	t.Helper()
++	if response == nil || response.Card == nil || response.Card.Type != "raw" {
++		t.Fatal("selection did not return the next card in the Feishu callback; the client can retain its old interactive view")
++	}
++	raw, err := json.Marshal(response.Card.Data)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var card map[string]any
++	if err = json.Unmarshal(raw, &card); err != nil {
++		t.Fatal(err)
++	}
++	return card
++}
++func (h *inlinePickerHarness) click(t *testing.T, card map[string]any, choice string) map[string]any {
++	t.Helper()
++	response, err := h.p.onCardAction(inlinePickerEvent(t, card, choice))
++	if err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-h.handled:
++	case <-time.After(3 * time.Second):
++		t.Fatal("normal engine dispatch did not finish")
++	}
++	next := inlinePickerResponseMap(t, response)
++	select {
++	case r := <-h.requests:
++		t.Fatalf("fast callback also sent an HTTP card update: %s", r.method)
++	default:
++	}
++	return next
++}
++
++func TestRenderCardMap_InPlaceCommandsEnableSharedUpdates(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		card := core.NewCard().Title("Picker", "blue").Buttons(core.DefaultBtn("Refresh", "cmd:/ccs")).Build()
++		card.UpdateOnAction = enabled
++		got := decodeRenderedCard(t, card)["config"].(map[string]any)["update_multi"]
++		if enabled && got != true {
++			t.Fatal("in-place command cards must enable shared updates for delayed PATCH delivery")
++		}
++		if !enabled && got != nil {
++			t.Fatal("ordinary cards unexpectedly changed their update mode")
++		}
++	}
++}
++
++func TestCUJ_FeishuCCSPicker_SelectProviderUpdatesOriginalCard(t *testing.T) {
++	h := newInlinePickerHarness(t)
++	providers := h.initial(t)
++	models := h.click(t, providers, "provider:0")
++	inlinePickerEvent(t, models, "model:1") // selected supplier's models are visible
++	inlinePickerEvent(t, models, "back")    // bottom navigation changed from the provider screen
++	confirm := h.click(t, models, "model:1")
++	inlinePickerEvent(t, confirm, "apply") // only preview the button; do not apply
++	models = h.click(t, confirm, "back")
++	cancelled := h.click(t, models, "cancel")
++	refreshed := h.click(t, cancelled, "cmd:/ccs")
++	inlinePickerEvent(t, refreshed, "provider:1")
++	if h.control.writes.Load() != 0 || h.agent.writes.Load() != 0 || h.agent.starts.Load() != 0 {
++		t.Fatal("read-only interaction switched state or started an agent")
++	}
++}
++
++func TestCardAction_InPlaceSlowReplyAcknowledgesThenPatchesOnlySource(t *testing.T) {
++	h := newInlinePickerHarness(t)
++	providers := h.initial(t)
++	release := make(chan struct{})
++	original := h.p.handler
++	h.p.handler = func(p core.Platform, msg *core.Message) { <-release; original(p, msg) }
++	start := time.Now()
++	response, err := h.p.onCardAction(inlinePickerEvent(t, providers, "provider:0"))
++	elapsed := time.Since(start)
++	close(release)
++	select {
++	case <-h.handled:
++	case <-time.After(4 * time.Second):
++		t.Fatal("late card was lost or blocked")
++	}
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response == nil || response.Toast == nil || response.Card != nil {
++		t.Fatal("slow callback must acknowledge before its deadline, then update asynchronously")
++	}
++	if elapsed >= 3*time.Second {
++		t.Fatalf("callback exceeded Feishu's deadline: %v", elapsed)
++	}
++	select {
++	case r := <-h.requests:
++		if r.method != http.MethodPatch || r.path != "/open-apis/im/v1/messages/om_picker" {
++			t.Fatal("late delivery did not PATCH the exact source")
++		}
++		inlinePickerEvent(t, r.card, "model:0")
++		if r.card["config"].(map[string]any)["update_multi"] != true {
++			t.Fatal("late update is not shared")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("late card was not delivered")
++	}
++	select {
++	case <-h.requests:
++		t.Fatal("late card was sent more than once")
++	default:
++	}
++	if h.control.writes.Load() != 0 || h.agent.writes.Load() != 0 {
++		t.Fatal("slow preview changed selection")
++	}
++}
+diff --git a/platform/feishu/card_command_test.go b/platform/feishu/card_command_test.go
+new file mode 100644
+index 0000000..27a8c6c
+--- /dev/null
++++ b/platform/feishu/card_command_test.go
+@@ -0,0 +1,203 @@
++package feishu
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/chenhg5/cc-connect/core"
++	lark "github.com/larksuite/oapi-sdk-go/v3"
++	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
++)
++
++func TestRenderCardMap_InPlaceCommandControls(t *testing.T) {
++	for _, inPlace := range []bool{false, true} {
++		for _, sessionKey := range []string{"", "test:picker-user"} {
++			t.Run(fmt.Sprintf("in-place=%t/key=%s", inPlace, sessionKey), func(t *testing.T) {
++				card := core.NewCard().Title("Picker", "blue").
++					Select("Provider", []core.CardSelectOption{{Text: "Alpha", Value: "cmd:/ccs pick token provider:0"}}, "").
++					Select("Legacy navigation", []core.CardSelectOption{{Text: "Help", Value: "nav:/help"}}, "").
++					ButtonsEqual(core.PrimaryBtn("Apply", "cmd:/ccs pick token apply"), core.DefaultBtn("Help", "nav:/help")).
++					Buttons(core.DefaultBtn("Cancel", "cmd:/ccs pick token cancel")).
++					ListItemBtn("An item", "Refresh", "default", "cmd:/ccs").Build()
++				card.UpdateOnAction = inPlace
++				var result any
++				if err := json.Unmarshal([]byte(renderCard(card, sessionKey)), &result); err != nil {
++					t.Fatal(err)
++				}
++				controls := 0
++				var walk func(any)
++				walk = func(node any) {
++					switch v := node.(type) {
++					case []any:
++						for _, child := range v {
++							walk(child)
++						}
++					case map[string]any:
++						if v["tag"] == "button" || v["tag"] == "select_static" {
++							controls++
++							value, _ := v["value"].(map[string]any)
++							action, _ := value["action"].(string)
++							if options, ok := v["options"].([]any); ok {
++								action, _ = options[0].(map[string]any)["value"].(string)
++							}
++							wantUpdate := inPlace && strings.HasPrefix(action, "cmd:")
++							if (value["update_card"] == "true") != wantUpdate {
++								t.Errorf("wrong in-place marker for %s: %#v", action, value)
++							}
++							if sessionKey != "" && value["session_key"] != sessionKey {
++								t.Error("lost session binding")
++							}
++							if sessionKey == "" && value["session_key"] != nil {
++								t.Error("invented a session key")
++							}
++						}
++						for _, child := range v {
++							walk(child)
++						}
++					}
++				}
++				walk(result)
++				if controls != 6 {
++					t.Fatalf("got %d controls, want 6", controls)
++				}
++			})
++		}
++	}
++}
++
++func TestCardAction_InPlaceCommandsUseNormalMessageDispatch(t *testing.T) {
++	for _, dropdown := range []bool{false, true} {
++		for _, update := range []bool{false, true} {
++			t.Run(fmt.Sprintf("dropdown=%t/update=%t", dropdown, update), func(t *testing.T) {
++				platform, err := New(map[string]any{"app_id": "cli_fixture", "app_secret": "fixture-only", "enable_feishu_card": true})
++				if err != nil {
++					t.Fatal(err)
++				}
++				p := platform.(*interactivePlatform)
++				messages := make(chan *core.Message, 2)
++				p.handler = func(_ core.Platform, msg *core.Message) { messages <- msg }
++				var navCalls atomic.Int32
++				p.cardNavHandler = func(string, string) *core.Card { navCalls.Add(1); return nil }
++				command := "cmd:/ccs pick fixture-token apply"
++				action := &callback.CallBackAction{Value: map[string]any{"session_key": "test:picker-user"}}
++				if update {
++					action.Value["update_card"] = "true"
++				}
++				if dropdown {
++					action.Option = command
++				} else {
++					action.Value["action"] = command
++				}
++				response, err := p.onCardAction(&callback.CardActionTriggerEvent{Event: &callback.CardActionTriggerRequest{
++					Operator: &callback.Operator{OpenID: "ou_picker"}, Action: action,
++					Context: &callback.Context{OpenChatID: "oc_picker", OpenMessageID: "om_exact_source"},
++				}})
++				if err != nil {
++					t.Fatal(err)
++				}
++				if response != nil && response.Card != nil {
++					t.Fatal("command bypassed the engine by returning an immediate card")
++				}
++				select {
++				case msg := <-messages:
++					if msg.Content != strings.TrimPrefix(command, "cmd:") || msg.UserID != "ou_picker" || msg.SessionKey != "test:picker-user" {
++						t.Fatalf("wrong dispatched message: %#v", msg)
++					}
++					rc, ok := msg.ReplyCtx.(replyContext)
++					if !ok || rc.messageID != "om_exact_source" || rc.updateCard != update {
++						t.Fatalf("wrong source context: %#v", msg.ReplyCtx)
++					}
++				case <-time.After(2 * time.Second):
++					t.Fatal("command was not dispatched")
++				}
++				if navCalls.Load() != 0 {
++					t.Fatal("command bypassed normal authorization through card navigation")
++				}
++				select {
++				case <-messages:
++					t.Fatal("command dispatched twice")
++				default:
++				}
++			})
++		}
++	}
++}
++
++func TestReplyCard_InPlaceTargetsSourceAndFallsBackWithoutReexecuting(t *testing.T) {
++	for _, mode := range []string{"success", "patch-error", "token-refresh"} {
++		t.Run(mode, func(t *testing.T) {
++			var authCalls, patchCalls, replyCalls, commandCalls atomic.Int32
++			card := core.NewCard().InPlace().Title("Model picker", "blue").
++				Select("Model", []core.CardSelectOption{{Text: "Model A", Value: "cmd:/ccs pick fixture model:0"}}, "").Build()
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				switch {
++				case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
++					n := authCalls.Add(1)
++					token := "fixture-fresh-token"
++					if mode == "token-refresh" && n == 1 {
++						token = "fixture-stale-token"
++					}
++					writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": token})
++				case r.Method == http.MethodPatch && r.URL.Path == "/open-apis/im/v1/messages/om_exact_source":
++					patchCalls.Add(1)
++					var body struct {
++						Content string `json:"content"`
++					}
++					if json.NewDecoder(r.Body).Decode(&body) != nil || !strings.Contains(body.Content, "select_static") || !strings.Contains(body.Content, "update_card") {
++						t.Error("PATCH did not contain the next interactive card")
++					}
++					if mode == "patch-error" {
++						writeJSON(t, w, map[string]any{"code": 230001, "msg": "fixture message cannot be edited"})
++					} else if mode == "token-refresh" && r.Header.Get("Authorization") == "Bearer fixture-stale-token" {
++						writeJSON(t, w, map[string]any{"code": 99991663, "msg": "Invalid access token for authorization"})
++					} else {
++						writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
++					}
++				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/om_exact_source/reply"):
++					replyCalls.Add(1)
++					writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": "om_fallback"}})
++				default:
++					t.Errorf("unexpected request (possibly the wrong source card): %s %s", r.Method, r.URL.Path)
++					http.Error(w, "unexpected request", 400)
++				}
++			}))
++			defer server.Close()
++			appID := "cli_picker_" + mode
++			p := &interactivePlatform{Platform: &Platform{
++				platformName: "feishu", domain: server.URL, appID: appID, appSecret: "fixture-only",
++				client:       lark.NewClient(appID, "fixture-only", lark.WithOpenBaseUrl(server.URL), lark.WithHttpClient(server.Client())),
++				replayClient: lark.NewClient(appID, "fixture-only", lark.WithEnableTokenCache(false), lark.WithOpenBaseUrl(server.URL), lark.WithHttpClient(server.Client())),
++				// This is deliberately a different card in the same session.
++				cardActionMsgIDs: map[string]string{"test:picker-user": "om_unrelated_newest_card"},
++			}}
++			p.handler = func(core.Platform, *core.Message) { commandCalls.Add(1) }
++			err := p.ReplyCard(context.Background(), replyContext{
++				messageID: "om_exact_source", chatID: "oc_picker", sessionKey: "test:picker-user", updateCard: true,
++			}, card)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if patchCalls.Load() < 1 || commandCalls.Load() != 0 {
++				t.Fatal("delivery reexecuted a command or did not PATCH")
++			}
++			if mode == "patch-error" {
++				if patchCalls.Load() != 1 || replyCalls.Load() != 1 {
++					t.Fatalf("PATCH failure: patches=%d replies=%d", patchCalls.Load(), replyCalls.Load())
++				}
++			} else if replyCalls.Load() != 0 {
++				t.Fatal("successful PATCH also sent a new message")
++			}
++			if mode == "token-refresh" && (patchCalls.Load() < 2 || authCalls.Load() < 2) {
++				t.Fatal("PATCH did not refresh an invalid tenant token")
++			}
++		})
++	}
++}
+diff --git a/platform/feishu/feishu.go b/platform/feishu/feishu.go
+index b329bbe..1809dfa 100644
+--- a/platform/feishu/feishu.go
++++ b/platform/feishu/feishu.go
+@@ -111,6 +111,8 @@ type replyContext struct {
+ 	chatID          string
+ 	sessionKey      string
+ 	bootstrapThread bool
++	updateCard      bool              // an authorized command callback may replace its source card
++	commandCard     *commandCardReply // exact callback awaiting the authorized next card
+ }
+ 
+ type Platform struct {
+@@ -657,7 +659,7 @@ func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
+ // Three prefixes are supported:
+ //   - nav:/xxx   — render a card page and update the original card in-place
+ //   - act:/xxx   — execute an action, then render and update the card in-place
+-//   - cmd:/xxx   — legacy: dispatch as a user command (sends a new message)
++//   - cmd:/xxx   — dispatch via normal command authorization; opt-in in-place replies
+ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+ 	if event.Event == nil || event.Event.Action == nil {
+ 		return nil, nil
+@@ -845,22 +847,34 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
+ 		}, nil
+ 	}
+ 
+-	// cmd: — async command dispatch, with optional in-place card replacement
++	// cmd: — normal authorized dispatch; in-place replies return through the callback
+ 	if strings.HasPrefix(actionVal, "cmd:") {
+ 		cmdText := strings.TrimPrefix(actionVal, "cmd:")
+-		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
++		updateCard, _ := event.Event.Action.Value["update_card"].(string)
++		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey,
++			updateCard: updateCard == "true" && messageID != ""}
++		var inline *commandCardReply
++		if rctx.updateCard {
++			inline = &commandCardReply{cards: make(chan *core.Card), done: make(chan struct{})}
++			rctx.commandCard = inline
++			defer close(inline.done)
++		}
+ 
+ 		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
+ 
+-		go p.dispatchCoreMessage(&core.Message{
+-			SessionKey: sessionKey,
+-			Platform:   p.platformName,
+-			UserID:     userID,
+-			UserName:   p.resolveUserName(userID),
+-			ChatName:   p.resolveChatName(chatID),
+-			Content:    cmdText,
+-			ReplyCtx:   rctx,
+-		})
++		go func() {
++			// Argument evaluation must also be asynchronous: profile lookups
++			// cannot consume Feishu's callback deadline before its timer starts.
++			p.dispatchCoreMessage(&core.Message{
++				SessionKey: sessionKey,
++				Platform:   p.platformName,
++				UserID:     userID,
++				UserName:   p.resolveUserName(userID),
++				ChatName:   p.resolveChatName(chatID),
++				Content:    cmdText,
++				ReplyCtx:   rctx,
++			})
++		}()
+ 
+ 		if ac, ok := event.Event.Action.Value["after_click"].(map[string]any); ok {
+ 			if title, _ := ac["title"].(string); title != "" {
+@@ -885,6 +899,9 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
+ 				}, nil
+ 			}
+ 		}
++		if inline != nil {
++			return inline.response(sessionKey), nil
++		}
+ 	}
+ 
+ 	return nil, nil
